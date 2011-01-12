@@ -224,6 +224,28 @@ struct bucket_engine bucket_engine = {
 
 /* Internal utility functions */
 
+static void must_lock(pthread_mutex_t *mutex)
+{
+    int rv = pthread_mutex_lock(mutex);
+    assert(rv == 0);
+}
+
+static void must_unlock(pthread_mutex_t *mutex)
+{
+    int rv = pthread_mutex_unlock(mutex);
+    assert(rv == 0);
+}
+
+static void lock_engines(void)
+{
+    must_lock(&bucket_engine.engines_mutex);
+}
+
+static void unlock_engines(void)
+{
+    must_unlock(&bucket_engine.engines_mutex);
+}
+
 static const char * bucket_state_name(bucket_state_t s) {
     const char * rv = NULL;
     switch(s) {
@@ -369,8 +391,7 @@ static void *engine_destroyer(void *arg) {
     peh->pe.v1->destroy(peh->pe.v0);
     bucket_engine.upstream_server->stat->release_stats(peh->stats);
 
-    int locked = pthread_mutex_lock(&bucket_engine.engines_mutex) == 0;
-    assert(locked);
+    lock_engines();
 
     int upd = genhash_delete_all(bucket_engine.engines,
                                  peh->name, peh->name_len);
@@ -378,7 +399,7 @@ static void *engine_destroyer(void *arg) {
     assert(genhash_find(bucket_engine.engines,
                         peh->name, peh->name_len) == NULL);
 
-    pthread_mutex_unlock(&bucket_engine.engines_mutex);
+    unlock_engines();
     free((void*)peh->name);
     free(peh);
 
@@ -386,7 +407,8 @@ static void *engine_destroyer(void *arg) {
 }
 
 static void release_handle(proxied_engine_handle_t *peh) {
-    if (peh && pthread_mutex_lock(&bucket_engine.engines_mutex) == 0) {
+    if (peh) {
+        lock_engines();
 
         assert(peh->refcount > 0);
         if (--peh->refcount == 0 && peh->state == STATE_STOPPING) {
@@ -405,19 +427,21 @@ static void release_handle(proxied_engine_handle_t *peh) {
             }
             pthread_attr_destroy(&attr);
         }
-        pthread_mutex_unlock(&bucket_engine.engines_mutex);
+
+        unlock_engines();
     }
 }
 
 static proxied_engine_handle_t* retain_handle(proxied_engine_handle_t *peh) {
     proxied_engine_handle_t *rv = NULL;
-    if (peh && pthread_mutex_lock(&bucket_engine.engines_mutex) == 0) {
+    if (peh) {
+        lock_engines();
         if (peh->state == STATE_RUNNING) {
             ++peh->refcount;
             assert(peh->refcount > 0);
             rv = peh;
         }
-        pthread_mutex_unlock(&bucket_engine.engines_mutex);
+        unlock_engines();
     }
     return rv;
 }
@@ -446,26 +470,21 @@ static ENGINE_ERROR_CODE create_bucket(struct bucket_engine *e,
     assert(peh);
     peh->stats = e->upstream_server->stat->new_stats();
     assert(peh->stats);
-    peh->refcount = 1;
+    peh->refcount = 0;
     peh->name = strdup(bucket_name);
     peh->name_len = strlen(peh->name);
     peh->state = STATE_RUNNING;
 
     ENGINE_ERROR_CODE rv = ENGINE_FAILED;
 
-    if (pthread_mutex_lock(&e->engines_mutex) != 0) {
-        release_handle(peh);
-        if (msg) {
-            snprintf(msg, msglen - 1, "Failed to acquire engines mutex.");
-        }
-        return rv;
-    }
+    lock_engines();
 
     peh->pe.v0 = load_engine(path, NULL, NULL);
 
     if (!peh->pe.v0) {
+        /* TODO: this is broken */
         release_handle(peh);
-        pthread_mutex_unlock(&e->engines_mutex);
+        unlock_engines();
         if (msg) {
             snprintf(msg, msglen - 1, "Failed to load engine.");
         }
@@ -487,7 +506,7 @@ static ENGINE_ERROR_CODE create_bucket(struct bucket_engine *e,
                 snprintf(msg, msglen - 1,
                          "Failed to initialize instance. Error code: %d\n", rv);
             }
-            pthread_mutex_unlock(&e->engines_mutex);
+            unlock_engines();
             return ENGINE_FAILED;
         }
 
@@ -500,9 +519,7 @@ static ENGINE_ERROR_CODE create_bucket(struct bucket_engine *e,
         rv = ENGINE_KEY_EEXISTS;
     }
 
-    release_handle(peh);
-
-    pthread_mutex_unlock(&e->engines_mutex);
+    unlock_engines();
 
     return rv;
 }
@@ -572,10 +589,9 @@ static void* refcount_dup(const void* ob, size_t vlen) {
     (void)vlen;
     proxied_engine_handle_t *peh = (proxied_engine_handle_t *)ob;
     assert(peh);
-    if (pthread_mutex_lock(&bucket_engine.engines_mutex) == 0) {
-        peh->refcount++;
-        pthread_mutex_unlock(&bucket_engine.engines_mutex);
-    }
+    lock_engines();
+    peh->refcount++;
+    unlock_engines();
     return (void*)ob;
 }
 
@@ -679,11 +695,10 @@ static void handle_connect(const void *cookie,
     proxied_engine_handle_t *peh = NULL;
     if (e->default_bucket_name != NULL) {
         // Assign a default named bucket (if there is one).
-        if (pthread_mutex_lock(&e->engines_mutex) == 0) {
-            peh = genhash_find(e->engines, e->default_bucket_name,
-                               strlen(e->default_bucket_name));
-            pthread_mutex_unlock(&e->engines_mutex);
-        }
+        lock_engines();
+        peh = genhash_find(e->engines, e->default_bucket_name,
+                           strlen(e->default_bucket_name));
+        unlock_engines();
         if (!peh && e->auto_create) {
             // XXX:  Need default config.
             create_bucket(e, e->default_bucket_name,
@@ -707,12 +722,9 @@ static void handle_auth(const void *cookie,
 
     const auth_data_t *auth_data = (const auth_data_t*)event_data;
     proxied_engine_handle_t *peh = NULL;
-    if (pthread_mutex_lock(&e->engines_mutex) == 0) {
-        peh = genhash_find(e->engines, auth_data->username, strlen(auth_data->username));
-        pthread_mutex_unlock(&e->engines_mutex);
-    } else {
-        return;
-    }
+    lock_engines();
+    peh = genhash_find(e->engines, auth_data->username, strlen(auth_data->username));
+    unlock_engines();
     if (!peh && e->auto_create) {
         create_bucket(e, auth_data->username, e->default_engine_path,
                       auth_data->config ? auth_data->config : "", &peh, NULL, 0);
@@ -875,13 +887,10 @@ static void add_engine(const void *key, size_t nkey,
 }
 
 static bool list_buckets(struct bucket_engine *e, struct bucket_list **blist) {
-    if (pthread_mutex_lock(&e->engines_mutex) == 0) {
-        genhash_iter(e->engines, add_engine, blist);
-        pthread_mutex_unlock(&e->engines_mutex);
-        return true;
-    } else {
-        return false;
-    }
+    lock_engines();
+    genhash_iter(e->engines, add_engine, blist);
+    unlock_engines();
+    return true;
 }
 
 static void bucket_list_free(struct bucket_list *blist) {
