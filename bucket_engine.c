@@ -528,8 +528,8 @@ static ENGINE_ERROR_CODE create_bucket(struct bucket_engine *e,
     return rv;
 }
 
-static inline proxied_engine_handle_t *get_engine_handle(ENGINE_HANDLE *h,
-                                                         const void *cookie) {
+static proxied_engine_handle_t *take_engine_handle(ENGINE_HANDLE *h,
+                                                   const void *cookie) {
     struct bucket_engine *e = (struct bucket_engine*)h;
     engine_specific_t *es = e->upstream_server->cookie->get_engine_specific(cookie);
     if (!es) {
@@ -546,7 +546,13 @@ static inline proxied_engine_handle_t *get_engine_handle(ENGINE_HANDLE *h,
     return peh ? peh : (e->default_engine.pe.v0 ? &e->default_engine : NULL);
 }
 
-static inline proxied_engine_handle_t* set_engine_handle(ENGINE_HANDLE *h,
+static void release_engine_handle(proxied_engine_handle_t *peh)
+{
+    (void)peh;
+    /* do nothing yet */
+}
+
+static proxied_engine_handle_t* set_engine_handle(ENGINE_HANDLE *h,
                                                          const void *cookie,
                                                          proxied_engine_handle_t *peh) {
     engine_specific_t *es = bucket_engine.upstream_server->cookie->get_engine_specific(cookie);
@@ -565,7 +571,7 @@ static inline proxied_engine_handle_t* set_engine_handle(ENGINE_HANDLE *h,
 
 static inline proxied_engine_t *get_engine(ENGINE_HANDLE *h,
                                            const void *cookie) {
-    proxied_engine_handle_t *peh = get_engine_handle(h, cookie);
+    proxied_engine_handle_t *peh = take_engine_handle(h, cookie);
     return (peh && peh->state == STATE_RUNNING) ? &peh->pe : NULL;
 }
 
@@ -980,7 +986,7 @@ static ENGINE_ERROR_CODE bucket_get_stats(ENGINE_HANDLE* handle,
 
     if (e) {
         rc = e->v1->get_stats(e->v0, cookie, stat_key, nkey, add_stat);
-        proxied_engine_handle_t *peh = get_engine_handle(handle, cookie);
+        proxied_engine_handle_t *peh = take_engine_handle(handle, cookie);
         if (nkey == 0) {
             char statval[20];
             snprintf(statval, 20, "%d", peh->refcount - 1);
@@ -993,12 +999,13 @@ static ENGINE_ERROR_CODE bucket_get_stats(ENGINE_HANDLE* handle,
 
 static void *bucket_get_stats_struct(ENGINE_HANDLE* handle,
                                      const void* cookie) {
-    proxied_engine_handle_t *peh = get_engine_handle(handle, cookie);
+    proxied_engine_handle_t *peh = take_engine_handle(handle, cookie);
+    void *rv =  NULL;
     if (peh != NULL && peh->state == STATE_RUNNING) {
-        return peh->stats;
-    } else {
-        return NULL;
+        rv = peh->stats;
     }
+    release_engine_handle(peh);
+    return rv;
 }
 
 static ENGINE_ERROR_CODE bucket_store(ENGINE_HANDLE* handle,
@@ -1109,30 +1116,33 @@ static tap_event_t bucket_tap_iterator_shim(ENGINE_HANDLE* handle,
                                             uint16_t *flags,
                                             uint32_t *seqno,
                                             uint16_t *vbucket) {
-    proxied_engine_handle_t *e = get_engine_handle(handle, cookie);
+    proxied_engine_handle_t *e = take_engine_handle(handle, cookie);
+    tap_event_t rv = TAP_DISCONNECT;
+
     if (e && e->tap_iterator) {
         assert(e->pe.v0 != handle);
-        return e->tap_iterator(e->pe.v0, cookie, itm,
-                               engine_specific, nengine_specific,
-                               ttl, flags, seqno, vbucket);
-    } else {
-        return TAP_DISCONNECT;
+        rv = e->tap_iterator(e->pe.v0, cookie, itm,
+                             engine_specific, nengine_specific,
+                             ttl, flags, seqno, vbucket);
     }
+    release_engine_handle(e);
+    return rv;
 }
 
 static TAP_ITERATOR bucket_get_tap_iterator(ENGINE_HANDLE* handle, const void* cookie,
                                             const void* client, size_t nclient,
                                             uint32_t flags,
                                             const void* userdata, size_t nuserdata) {
-    proxied_engine_handle_t *e = get_engine_handle(handle, cookie);
+    proxied_engine_handle_t *e = take_engine_handle(handle, cookie);
+    TAP_ITERATOR rv = NULL;
     if (e) {
         e->tap_iterator = e->pe.v1->get_tap_iterator(e->pe.v0, cookie,
                                                      client, nclient,
                                                      flags, userdata, nuserdata);
-        return e->tap_iterator ? bucket_tap_iterator_shim : NULL;
-    } else {
-        return NULL;
+        rv = e->tap_iterator ? bucket_tap_iterator_shim : NULL;
     }
+    release_engine_handle(e);
+    return rv;
 }
 
 static size_t bucket_errinfo(ENGINE_HANDLE *handle, const void* cookie,
