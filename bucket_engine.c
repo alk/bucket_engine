@@ -59,7 +59,6 @@ struct bucket_engine {
     char *default_bucket_name;
     proxied_engine_handle_t default_engine;
     pthread_mutex_t engines_mutex;
-    pthread_mutex_t retention_mutex;
     genhash_t *engines;
     GET_SERVER_API get_server_api;
     SERVER_HANDLE_V1 server;
@@ -371,7 +370,7 @@ static void *engine_destroyer(void *arg) {
     peh->pe.v1->destroy(peh->pe.v0);
     bucket_engine.upstream_server->stat->release_stats(peh->stats);
 
-    int locked = pthread_mutex_lock(&bucket_engine.retention_mutex) == 0;
+    int locked = pthread_mutex_lock(&bucket_engine.engines_mutex) == 0;
     assert(locked);
 
     int upd = genhash_delete_all(bucket_engine.engines,
@@ -380,7 +379,7 @@ static void *engine_destroyer(void *arg) {
     assert(genhash_find(bucket_engine.engines,
                         peh->name, peh->name_len) == NULL);
 
-    pthread_mutex_unlock(&bucket_engine.retention_mutex);
+    pthread_mutex_unlock(&bucket_engine.engines_mutex);
     free((void*)peh->name);
     free(peh);
 
@@ -388,7 +387,7 @@ static void *engine_destroyer(void *arg) {
 }
 
 static void release_handle(proxied_engine_handle_t *peh) {
-    if (peh && pthread_mutex_lock(&bucket_engine.retention_mutex) == 0) {
+    if (peh && pthread_mutex_lock(&bucket_engine.engines_mutex) == 0) {
 
         assert(peh->refcount > 0);
         if (--peh->refcount == 0 && peh->state == STATE_STOPPING) {
@@ -407,19 +406,19 @@ static void release_handle(proxied_engine_handle_t *peh) {
             }
             pthread_attr_destroy(&attr);
         }
-        pthread_mutex_unlock(&bucket_engine.retention_mutex);
+        pthread_mutex_unlock(&bucket_engine.engines_mutex);
     }
 }
 
 static proxied_engine_handle_t* retain_handle(proxied_engine_handle_t *peh) {
     proxied_engine_handle_t *rv = NULL;
-    if (peh && pthread_mutex_lock(&bucket_engine.retention_mutex) == 0) {
+    if (peh && pthread_mutex_lock(&bucket_engine.engines_mutex) == 0) {
         if (peh->state == STATE_STARTING || peh->state == STATE_RUNNING) {
             ++peh->refcount;
             assert(peh->refcount > 0);
             rv = peh;
         }
-        pthread_mutex_unlock(&bucket_engine.retention_mutex);
+        pthread_mutex_unlock(&bucket_engine.engines_mutex);
     }
     return rv;
 }
@@ -574,9 +573,9 @@ static void* refcount_dup(const void* ob, size_t vlen) {
     (void)vlen;
     proxied_engine_handle_t *peh = (proxied_engine_handle_t *)ob;
     assert(peh);
-    if (pthread_mutex_lock(&bucket_engine.retention_mutex) == 0) {
+    if (pthread_mutex_lock(&bucket_engine.engines_mutex) == 0) {
         peh->refcount++;
-        pthread_mutex_unlock(&bucket_engine.retention_mutex);
+        pthread_mutex_unlock(&bucket_engine.engines_mutex);
     }
     return (void*)ob;
 }
@@ -730,11 +729,6 @@ static ENGINE_ERROR_CODE bucket_initialize(ENGINE_HANDLE* handle,
 
     if (pthread_mutex_init(&se->engines_mutex, NULL) != 0) {
         fprintf(stderr, "Error initializing mutex for bucket engine.\n");
-        return ENGINE_FAILED;
-    }
-
-    if (pthread_mutex_init(&se->retention_mutex, NULL) != 0) {
-        fprintf(stderr, "Error initializing retention mutex for bucket engine.\n");
         return ENGINE_FAILED;
     }
 
