@@ -302,6 +302,8 @@ static void bucket_register_callback(ENGINE_HANDLE *eh,
         proxied_engine_handle_t *peh;
     } find_data = { eh, NULL };
 
+    lock_engines();
+
     genhash_iter(bucket_engine.engines, find_bucket_by_engine, &find_data);
 
     if (find_data.peh) {
@@ -309,6 +311,8 @@ static void bucket_register_callback(ENGINE_HANDLE *eh,
         find_data.peh->cb = cb;
         find_data.peh->cb_data = cb_data;
     }
+
+    unlock_engines();
 }
 
 static void bucket_perform_callbacks(ENGINE_EVENT_TYPE type,
