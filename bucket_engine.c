@@ -1453,6 +1453,7 @@ static ENGINE_ERROR_CODE handle_delete_bucket(ENGINE_HANDLE* handle,
             found = true;
             peh->state = STATE_STOPPING;
             spawn_bucket_destroyer(peh);
+            printf("spawned bucket destroyer for %s\n", peh->name);
         }
         must_unlock(&peh->lock);
     }
