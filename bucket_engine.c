@@ -827,6 +827,9 @@ static ENGINE_ERROR_CODE bucket_initialize(ENGINE_HANDLE* handle,
 
     assert(!se->initialized);
 
+    setvbuf(stdout, 0, _IOLBF, 0);
+    setvbuf(stderr, 0, _IOLBF, 0);
+
     if (pthread_mutex_init(&se->engines_mutex, NULL) != 0) {
         fprintf(stderr, "Error initializing mutex for bucket engine.\n");
         return ENGINE_FAILED;
