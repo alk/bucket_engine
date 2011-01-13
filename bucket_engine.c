@@ -401,13 +401,16 @@ ENGINE_ERROR_CODE create_instance(uint64_t interface,
     return ENGINE_SUCCESS;
 }
 
-static proxied_engine_handle_t *find_bucket_unlocked(const char *name) {
+static proxied_engine_handle_t *find_bucket_locked(const char *name) {
     return genhash_find(bucket_engine.engines, name, strlen(name));
 }
 
+/* returns proxied_engine_handle_t for bucket with given name. This
+ * increments refcount of returned handle, so caller is responsible
+ * for calling release_handle on it. */
 static proxied_engine_handle_t *find_bucket(const char *name) {
     lock_engines();
-    proxied_engine_handle_t *rv = find_bucket_unlocked(name);
+    proxied_engine_handle_t *rv = find_bucket_locked(name);
     if (rv) {
         pthread_mutex_t *lock = &rv->lock;
         must_lock(lock);
@@ -488,6 +491,8 @@ static void free_engine_handle(proxied_engine_handle_t *peh) {
     free(peh);
 }
 
+/* Creates bucket and places it's handle into *e_out. NOTE: that
+ * called is responsible for calling release_handle on that handle */
 static ENGINE_ERROR_CODE create_bucket(struct bucket_engine *e,
                                        const char *bucket_name,
                                        const char *path,
@@ -521,7 +526,7 @@ static ENGINE_ERROR_CODE create_bucket(struct bucket_engine *e,
 
     lock_engines();
 
-    proxied_engine_handle_t *tmppeh = find_bucket_unlocked(bucket_name);
+    proxied_engine_handle_t *tmppeh = find_bucket_locked(bucket_name);
     if (tmppeh == NULL) {
         genhash_update(e->engines, bucket_name, strlen(bucket_name), peh, 0);
 
@@ -552,6 +557,8 @@ static ENGINE_ERROR_CODE create_bucket(struct bucket_engine *e,
     if (rv == ENGINE_SUCCESS) {
         if (e_out) {
             *e_out = peh;
+        } else {
+            release_handle(peh);
         }
     } else {
         free_engine_handle(peh);
@@ -560,6 +567,9 @@ static ENGINE_ERROR_CODE create_bucket(struct bucket_engine *e,
     return rv;
 }
 
+/* Returns engine handle for this connection. Every access to underlying
+ * engine must go through this function. At the end of such access
+ * release_engine_handle must be called. */
 static proxied_engine_handle_t *take_engine_handle(ENGINE_HANDLE *h,
                                                    const void *cookie) {
     struct bucket_engine *e = (struct bucket_engine*)h;
@@ -591,6 +601,7 @@ static proxied_engine_handle_t *take_engine_handle(ENGINE_HANDLE *h,
     return peh;
 }
 
+/* this must be called on handles returned from take_engine_handle. */
 static void release_engine_handle(proxied_engine_handle_t *peh) {
     if (!peh)
         return;
@@ -618,10 +629,6 @@ static proxied_engine_handle_t* set_engine_handle(ENGINE_HANDLE *h,
     return es->peh;
 }
 
-static proxied_engine_handle_t *engine_to_engine_handle(proxied_engine_t *e) {
-    return (proxied_engine_handle_t *)((char *)e - offsetof(proxied_engine_handle_t, pe));
-}
-
 static proxied_engine_t *take_engine(ENGINE_HANDLE *h,
                                      const void *cookie) {
     proxied_engine_handle_t *peh = take_engine_handle(h, cookie);
@@ -630,6 +637,10 @@ static proxied_engine_t *take_engine(ENGINE_HANDLE *h,
         return NULL;
 
     return &peh->pe;
+}
+
+static proxied_engine_handle_t *engine_to_engine_handle(proxied_engine_t *e) {
+    return (proxied_engine_handle_t *)(((char *)e) - offsetof(proxied_engine_handle_t, pe));
 }
 
 static void release_engine(proxied_engine_t *e) {
@@ -880,6 +891,7 @@ static void bucket_destroy(ENGINE_HANDLE* handle) {
         free(se->default_bucket_name);
         se->default_bucket_name = NULL;
         pthread_mutex_destroy(&se->engines_mutex);
+        pthread_mutex_destroy(&se->dlopen_mutex);
         se->initialized = false;
     }
 }
@@ -1073,7 +1085,7 @@ static void *bucket_get_stats_struct(ENGINE_HANDLE* handle,
                                      const void* cookie) {
     proxied_engine_handle_t *peh = take_engine_handle(handle, cookie);
     void *rv =  NULL;
-    if (peh != NULL && peh->state == STATE_RUNNING) {
+    if (peh != NULL) {
         rv = peh->stats;
     }
     release_engine_handle(peh);
@@ -1123,7 +1135,7 @@ static ENGINE_ERROR_CODE bucket_flush(ENGINE_HANDLE* handle,
     proxied_engine_t *e = take_engine(handle, cookie);
     ENGINE_ERROR_CODE rv = ENGINE_DISCONNECT;
     if (e) {
-      rv = e->v1->flush(e->v0, cookie, when);
+        rv = e->v1->flush(e->v0, cookie, when);
     }
     release_engine(e);
     return rv;
@@ -1352,12 +1364,12 @@ static void *engine_destructor(void *arg) {
 
     unlock_engines();
 
-    /* now drop main ref to handle */
+    /* now drop main ref */
     release_handle(peh);
     return NULL;
 }
 
-static void spawn_bucket_destroyer_locked(proxied_engine_handle_t *peh) {
+static void spawn_bucket_destroyer(proxied_engine_handle_t *peh) {
     pthread_attr_t attr;
     if (pthread_attr_init(&attr) != 0 ||
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0) {
@@ -1395,7 +1407,7 @@ static ENGINE_ERROR_CODE handle_delete_bucket(ENGINE_HANDLE* handle,
         if (peh->state == STATE_RUNNING) {
             found = true;
             peh->state = STATE_STOPPING;
-            spawn_bucket_destroyer_locked(peh);
+            spawn_bucket_destroyer(peh);
         }
         must_unlock(&peh->lock);
     }
