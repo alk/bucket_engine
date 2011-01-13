@@ -434,7 +434,7 @@ static void release_handle(proxied_engine_handle_t *peh) {
 
     assert(peh->refcount > 0);
     if (--peh->refcount == 0) {
-        assert(peh->state == STATE_STOPPING);
+        assert(peh->state == STATE_NULL);
         assert(peh->bottom_refcnt == 0);
 
         // We should never free the default engine.
@@ -1365,6 +1365,7 @@ static void *engine_destructor(void *arg) {
     assert(upd == 1);
     assert(genhash_find(bucket_engine.engines,
                         peh->name, peh->name_len) == NULL);
+    assert(peh->state == STATE_NULL);
 
     unlock_engines();
 
