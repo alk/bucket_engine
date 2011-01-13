@@ -442,6 +442,7 @@ static void release_handle(proxied_engine_handle_t *peh) {
 
         must_unlock(&peh->lock);
 
+        printf("Freed handle for bucket: %s\n", peh->name);
         free_engine_handle(peh);
         return;
     }
@@ -1349,12 +1350,15 @@ static void *engine_destructor(void *arg) {
         pthread_cond_wait(&peh->free_cond, &peh->lock);
     must_unlock(&peh->lock);
     assert(peh->state == STATE_STOPPING);
+    printf("Going to destroy engine for bucket %s\n", peh->name);
     /* at this point we know that old requests have completed and no
      * new request will use underlying engine. So it's safe to destroy
      * it */
     peh->pe.v1->destroy(peh->pe.v0);
 
     lock_engines();
+
+    printf("Destroyed engine for bucket %s. Got engines mutex\n", peh->name);
 
     int upd = genhash_delete_all(bucket_engine.engines,
                                  peh->name, peh->name_len);
@@ -1364,6 +1368,7 @@ static void *engine_destructor(void *arg) {
 
     unlock_engines();
 
+    printf("Destroyed engine for bucket %s. Dropping main ref\n", peh->name);
     /* now drop main ref */
     release_handle(peh);
     return NULL;
