@@ -561,6 +561,8 @@ static ENGINE_ERROR_CODE create_bucket(struct bucket_engine *e,
 
     unlock_engines();
 
+    printf("create_bucket(%s): rv = %d, success = %d\n", peh->name, rv, rv == ENGINE_SUCCESS);
+
     if (rv == ENGINE_SUCCESS) {
         if (e_out) {
             *e_out = peh;
