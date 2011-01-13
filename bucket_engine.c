@@ -27,7 +27,8 @@ typedef union proxied_engine {
 typedef enum {
     STATE_NULL,
     STATE_RUNNING,
-    STATE_STOPPING
+    STATE_STOPPING,
+    STATE_STOPPING_2
 } bucket_state_t;
 
 typedef struct proxied_engine_handle {
@@ -268,6 +269,7 @@ static const char * bucket_state_name(bucket_state_t s) {
     case STATE_NULL: rv = "NULL"; break;
     case STATE_RUNNING: rv = "running"; break;
     case STATE_STOPPING: rv = "stopping"; break;
+    case STATE_STOPPING_2: rv = "stopping 2"; break;
     }
     assert(rv);
     return rv;
@@ -434,16 +436,20 @@ static void release_handle(proxied_engine_handle_t *peh) {
 
     assert(peh->refcount > 0);
     if (--peh->refcount == 0) {
-        assert(peh->state == STATE_NULL);
+        assert(peh->state == STATE_STOPPING_2);
         assert(peh->bottom_refcnt == 0);
 
         // We should never free the default engine.
         assert(peh != &bucket_engine.default_engine);
 
+        pthread_cond_broadcast(&peh->free_cond);
+
         must_unlock(&peh->lock);
 
+#if 0
         printf("Freed handle for bucket: %s\n", peh->name);
         free_engine_handle(peh);
+#endif
         return;
     }
 
@@ -1354,6 +1360,7 @@ static void *engine_destructor(void *arg) {
     /* at this point we know that old requests have completed and no
      * new request will use underlying engine. So it's safe to destroy
      * it */
+#if 0
     peh->pe.v1->destroy(peh->pe.v0);
 
     lock_engines();
@@ -1370,8 +1377,40 @@ static void *engine_destructor(void *arg) {
     unlock_engines();
 
     printf("Destroyed engine for bucket %s. Dropping main ref\n", peh->name);
+#endif
+    must_lock(&peh->lock);
+    peh->state = STATE_STOPPING_2;
+    must_unlock(&peh->lock);
+
     /* now drop main ref */
     release_handle(peh);
+
+#if 1
+    must_lock(&peh->lock);
+    while (peh->refcount)
+        pthread_cond_wait(&peh->free_cond, &peh->lock);
+    must_unlock(&peh->lock);
+
+    peh->pe.v1->destroy(peh->pe.v0);
+
+    lock_engines();
+
+    printf("Destroyed engine for bucket %s. Got engines mutex\n", peh->name);
+
+    int upd = genhash_delete_all(bucket_engine.engines,
+                                 peh->name, peh->name_len);
+    assert(upd == 1);
+    assert(genhash_find(bucket_engine.engines,
+                        peh->name, peh->name_len) == NULL);
+    assert(peh->state == STATE_NULL);
+
+    unlock_engines();
+
+    printf("Destroyed engine for bucket %s. Dropping main ref\n", peh->name);
+    printf("Freed handle for bucket: %s\n", peh->name);
+    free_engine_handle(peh);
+#endif
+
     return NULL;
 }
 
