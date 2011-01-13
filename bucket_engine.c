@@ -199,6 +199,8 @@ static ENGINE_HANDLE *load_engine(const char *soname, const char *config_str,
 
 static bool authorized(ENGINE_HANDLE* handle, const void* cookie);
 
+static void free_engine_handle(proxied_engine_handle_t *);
+
 struct bucket_engine bucket_engine = {
     .engine = {
         .interface = {
@@ -442,8 +444,6 @@ static void release_handle(proxied_engine_handle_t *peh) {
     }
 
     must_unlock(&peh->lock);
-
-    free_engine_handle(peh);
 }
 
 static proxied_engine_handle_t* retain_handle(proxied_engine_handle_t *peh) {
@@ -470,7 +470,7 @@ static bool has_valid_bucket_name(const char *n) {
 
 /* fills engine handle. Assumes that it's zeroed already */
 static void init_engine_handle(proxied_engine_handle_t *peh, const char *name) {
-    peh->stats = e->upstream_server->stat->new_stats();
+    peh->stats = bucket_engine.upstream_server->stat->new_stats();
     assert(peh->stats);
     peh->refcount = 1;
     peh->name = strdup(name);
@@ -484,7 +484,7 @@ static void free_engine_handle(proxied_engine_handle_t *peh) {
     pthread_mutex_destroy(&peh->lock);
     pthread_cond_destroy(&peh->free_cond);
     bucket_engine.upstream_server->stat->release_stats(peh->stats);
-    free(peh->name);
+    free((void *)peh->name);
     free(peh);
 }
 
@@ -503,15 +503,12 @@ static ENGINE_ERROR_CODE create_bucket(struct bucket_engine *e,
     if (peh == NULL) {
         return ENGINE_FAILED;
     }
-
     init_engine_handle(peh, bucket_name);
 
     ENGINE_ERROR_CODE rv = ENGINE_FAILED;
 
     must_lock(&bucket_engine.dlopen_mutex);
-
     peh->pe.v0 = load_engine(path, NULL, NULL);
-
     must_unlock(&bucket_engine.dlopen_mutex);
 
     if (!peh->pe.v0) {
@@ -574,7 +571,6 @@ static proxied_engine_handle_t *take_engine_handle(ENGINE_HANDLE *h,
     bucket_state_t state;
 
     if (!peh) {
-    return_nothing:
         return e->default_engine.pe.v0 ? &e->default_engine : NULL;
     }
 
@@ -586,7 +582,7 @@ static proxied_engine_handle_t *take_engine_handle(ENGINE_HANDLE *h,
         release_handle(es->peh);
         e->upstream_server->cookie->store_engine_specific(cookie, NULL);
         free(es);
-        goto return_nothing;
+        return NULL;
     }
 
     peh->bottom_refcnt++;
@@ -602,7 +598,7 @@ static void release_engine_handle(proxied_engine_handle_t *peh) {
     int refcnt = --peh->bottom_refcnt;
     if (peh->state == STATE_STOPPING && refcnt == 0)
         pthread_cond_signal(&peh->free_cond);
-    must_unlock(&peh->bucket_lock);
+    must_unlock(&peh->lock);
 }
 
 static proxied_engine_handle_t* set_engine_handle(ENGINE_HANDLE *h,
@@ -1334,11 +1330,11 @@ static ENGINE_ERROR_CODE handle_create_bucket(ENGINE_HANDLE* handle,
     return ENGINE_SUCCESS;
 }
 
-void *engine_destructor(void *arg) {
+static void *engine_destructor(void *arg) {
     proxied_engine_handle_t *peh = arg;
     must_lock(&peh->lock);
     while (peh->bottom_refcnt)
-        pthread_cond_wait(&peh->free_cond);
+        pthread_cond_wait(&peh->free_cond, &peh->lock);
     must_unlock(&peh->lock);
     assert(peh->state == STATE_STOPPING);
     /* at this point we know that old requests have completed and no
@@ -1379,7 +1375,7 @@ static ENGINE_ERROR_CODE handle_delete_bucket(ENGINE_HANDLE* handle,
                                               const void* cookie,
                                               protocol_binary_request_header *request,
                                               ADD_RESPONSE response) {
-    struct bucket_engine *e = (struct bucket_engine*)handle;
+    (void)handle;
     protocol_binary_request_delete_bucket *breq =
         (protocol_binary_request_delete_bucket*)request;
 
@@ -1399,7 +1395,7 @@ static ENGINE_ERROR_CODE handle_delete_bucket(ENGINE_HANDLE* handle,
         if (peh->state == STATE_RUNNING) {
             found = true;
             peh->state = STATE_STOPPING;
-            spawn_bucket_destroyer_locked();
+            spawn_bucket_destroyer_locked(peh);
         }
         must_unlock(&peh->lock);
     }
@@ -1481,7 +1477,6 @@ static ENGINE_ERROR_CODE handle_expand_bucket(ENGINE_HANDLE* handle,
                                               const void* cookie,
                                               protocol_binary_request_header *request,
                                               ADD_RESPONSE response) {
-    struct bucket_engine *e = (struct bucket_engine*)handle;
     protocol_binary_request_delete_bucket *breq =
         (protocol_binary_request_delete_bucket*)request;
 
@@ -1507,7 +1502,6 @@ static ENGINE_ERROR_CODE handle_select_bucket(ENGINE_HANDLE* handle,
                                               const void* cookie,
                                               protocol_binary_request_header *request,
                                               ADD_RESPONSE response) {
-    struct bucket_engine *e = (struct bucket_engine*)handle;
     protocol_binary_request_delete_bucket *breq =
         (protocol_binary_request_delete_bucket*)request;
 
