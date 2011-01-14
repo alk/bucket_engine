@@ -594,7 +594,11 @@ static void dequeue_connection(engine_specific_t *es) {
     if (!peh)
         return;
     must_lock(&peh->lock);
-    dequeue_connection_locked(es);
+    /* HERE: the problem is that we don't wont to touch list fields
+     * under STATE_STOPPING, but we can encounter select bucket from
+     * dead bucket to live */
+    if (peh->state == STATE_RUNNING)
+        dequeue_connection_locked(es);
     release_handle_unlock(peh);
 }
 
