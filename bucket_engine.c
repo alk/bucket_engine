@@ -432,6 +432,8 @@ static proxied_engine_handle_t *find_bucket(const char *name) {
     return rv;
 }
 
+static void release_handle_unlock(proxied_engine_handle_t *peh);
+
 static void release_handle(proxied_engine_handle_t *peh) {
     if (!peh) {
         return;
