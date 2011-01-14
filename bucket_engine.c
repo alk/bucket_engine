@@ -33,11 +33,16 @@ typedef enum {
 struct proxied_engine_handle;
 
 typedef struct engine_specific {
-    struct proxied_engine_handle *peh;
     const void              *cookie;
     void                    *engine_specific;
     struct engine_specific  *next;
     struct engine_specific  **pprev;
+    pthread_mutex_t         lock; /* guards peh */
+    /* TODO: initialize and destroy this properly */
+    /* TODO: change handle_disconnect to free this */
+    /* TODO: make set set_engine_handle locks this properly */
+    /* TODO: take care of bucket destroy sequence */
+    struct proxied_engine_handle *peh;
 } engine_specific_t;
 
 typedef struct proxied_engine_handle {
@@ -615,6 +620,8 @@ static void enqueue_connection(engine_specific_t *es, proxied_engine_handle_t *p
 /* Returns engine handle for this connection. Every access to underlying
  * engine must go through this function. At the end of such access
  * release_engine_handle must be called. */
+/* Must be called from worker thread that owns that connection so that
+ * engine_specific_t cannot disappear while this is running. */
 static proxied_engine_handle_t *take_engine_handle(ENGINE_HANDLE *h,
                                                    const void *cookie) {
     struct bucket_engine *e = (struct bucket_engine*)h;
@@ -622,10 +629,14 @@ static proxied_engine_handle_t *take_engine_handle(ENGINE_HANDLE *h,
     if (!es) {
         return NULL;
     }
+    /* we have to lock engine_specific_t so that peh cannot disappear
+     * after we grabbed it and before we locked it */
+    must_lock(&es->lock);
     proxied_engine_handle_t *peh = es->peh;
     bucket_state_t state;
 
     if (!peh) {
+        must_unlock(&es->lock);
         return e->default_engine.pe.v0 ? &e->default_engine : NULL;
     }
 
@@ -634,12 +645,14 @@ static proxied_engine_handle_t *take_engine_handle(ENGINE_HANDLE *h,
 
     if (state != STATE_RUNNING) {
         must_unlock(&peh->lock);
+        must_unlock(&es->lock);
         return NULL;
     }
 
     peh->bottom_refcnt++;
 
     must_unlock(&peh->lock);
+    must_unlock(&es->lock);
     return peh;
 }
 
@@ -659,6 +672,9 @@ static void release_engine_handle(proxied_engine_handle_t *peh) {
     must_unlock(&peh->lock);
 }
 
+/* Must be called from worker thread that owns this connection, so
+ * that concurrent set_engine_handle invocations on same connection
+ * don't happen */
 static proxied_engine_handle_t* set_engine_handle(ENGINE_HANDLE *h,
                                                   const void *cookie,
                                                   proxied_engine_handle_t *peh) {
@@ -669,19 +685,22 @@ static proxied_engine_handle_t* set_engine_handle(ENGINE_HANDLE *h,
         assert(es);
         struct bucket_engine *e = (struct bucket_engine*)h;
         es->cookie = cookie;
+        pthread_mutex_init(&es->lock);
         e->upstream_server->cookie->store_engine_specific(cookie, es);
     }
+    must_lock(&es->lock);
     // out with the old
     if (es->peh) {
         proxied_engine_handle_t *old_peh = es->peh;
         must_lock(&old_peh->lock);
-        if (old_peh->state == STATE_RUNNING)
-            dequeue_connection_locked(es);
+        dequeue_connection_locked(es);
         must_unlock(&old_peh->lock);
     }
     // In with the new
-    enqueue_connection(es, retain_handle(peh));
-    return es->peh;
+    proxied_engine_handle_t *new_peh = retain_handle(peh);
+    enqueue_connection(es, new_peh);
+    must_unlock(&es->lock);
+    return new_peh;
 }
 
 static proxied_engine_t *take_engine(ENGINE_HANDLE *h,
@@ -802,6 +821,16 @@ static ENGINE_HANDLE *load_engine(const char *soname, const char *config_str,
     return engine;
 }
 
+/* HERE: this is unfinished and broken!!! */
+/* This code is responsible for:
+ *
+ * a) final freeing of engine_specific (it's the only piece of code
+ * allowed to do that)
+ *
+ * b) dequeing engine_specific from peh and calling underlying engine
+ * callback. _But_ this only happens for STATE_RUNNING. If state is
+ * different this actions are performed by bucket destructor thread.
+ */
 static void handle_disconnect(const void *cookie,
                               ENGINE_EVENT_TYPE type,
                               const void *event_data,
@@ -816,9 +845,12 @@ static void handle_disconnect(const void *cookie,
         return;
     }
 
+    must_lock(&es->lock);
+
     proxied_engine_handle_t *peh = es->peh;
 
     if (peh == NULL) {
+        /* TODO: must free es here */
         return;
     }
 
