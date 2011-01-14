@@ -59,8 +59,9 @@ typedef struct proxied_engine_handle {
                                     * (but can happen later because
                                     * some connection can hold
                                     * pointer longer) */
-    int                  bottom_refcnt; /* counts active
-                                         * take_engine_handle(s) */
+    int                  bottom_refcnt; /* non-zero value indicates
+                                         * in-flight engine
+                                         * operation */
     pthread_cond_t       free_cond; /* bucket delete thread waits on
                                      * that until bottom_refcnt is 0 */
     bucket_state_t       state;
@@ -431,7 +432,16 @@ static proxied_engine_handle_t *find_bucket(const char *name) {
     return rv;
 }
 
-static void release_handle_locked(proxied_engine_handle_t *peh) {
+static void release_handle(proxied_engine_handle_t *peh) {
+    if (!peh) {
+        return;
+    }
+
+    must_lock(&peh->lock);
+    release_handle_unlock(peh);
+}
+
+static void release_handle_unlock(proxied_engine_handle_t *peh) {
     assert(peh->refcount > 0);
     if (--peh->refcount == 0) {
         assert(peh->state == STATE_NULL);
@@ -446,15 +456,6 @@ static void release_handle_locked(proxied_engine_handle_t *peh) {
         free_engine_handle(peh);
         return;
     }
-}
-
-static void release_handle(proxied_engine_handle_t *peh) {
-    if (!peh) {
-        return;
-    }
-
-    must_lock(&peh->lock);
-    release_handle_locked(peh);
     must_unlock(&peh->lock);
 }
 
@@ -576,12 +577,13 @@ static ENGINE_ERROR_CODE create_bucket(struct bucket_engine *e,
     return rv;
 }
 
-static void dequeue_connection_locked(engine_specific_t *es, proxied_engine_handle_t *peh) {
+/* Like dequeue_connection, but under peh lock _and_ _without_ final
+ * release_handle */
+static void dequeue_connection_locked(engine_specific_t *es) {
     if (es->next)
         es->next->pprev = es->pprev;
     *(es->pprev) = es->next;
     es->peh = NULL;
-    release_handle_locked(peh);
 }
 
 static void dequeue_connection(engine_specific_t *es) {
@@ -590,8 +592,8 @@ static void dequeue_connection(engine_specific_t *es) {
     if (!peh)
         return;
     must_lock(&peh->lock);
-    dequeue_connection_locked(es, peh);
-    must_unlock(&peh->lock);
+    dequeue_connection_locked(es);
+    release_handle_unlock(peh);
 }
 
 static void enqueue_connection(engine_specific_t *es, proxied_engine_handle_t *peh) {
@@ -642,14 +644,18 @@ static proxied_engine_handle_t *take_engine_handle(ENGINE_HANDLE *h,
     return peh;
 }
 
+static void release_engine_handle_locked(proxied_engine_handle_t *peh) {
+    int refcnt = --peh->bottom_refcnt;
+    if (peh->state == STATE_STOPPING && refcnt == 0)
+        pthread_cond_signal(&peh->free_cond);
+}
+
 /* this must be called on handles returned from take_engine_handle. */
 static void release_engine_handle(proxied_engine_handle_t *peh) {
     if (!peh)
         return;
     must_lock(&peh->lock);
-    int refcnt = --peh->bottom_refcnt;
-    if (peh->state == STATE_STOPPING && refcnt == 0)
-        pthread_cond_signal(&peh->free_cond);
+    release_engine_handle_locked(peh);
     must_unlock(&peh->lock);
 }
 
@@ -821,18 +827,18 @@ static void handle_disconnect(const void *cookie,
     /* We increment bottom_refcnt so that engine is not destoyed under
      * us */
     peh->bottom_refcnt++;
-    peh->refcount++; /* dequeue decrements refcount so we increment it to compensate */
-    dequeue_connection_locked(es, peh);
-    must_unlock(&peh->lock);
+    dequeue_connection_locked(es);
 
     if (peh->wants_disconnects) {
+        must_unlock(&peh->lock);
         peh->cb(cookie, type, event_data, peh->cb_data);
+        must_lock(&peh->lock);
     }
 
     /* Allow engine to be destructed */
-    release_engine_handle(peh);
+    release_engine_handle_locked(peh);
     // Free up the engine we were using.
-    release_handle(peh);
+    release_handle_unlock(peh);
 
     free(es);
     e->upstream_server->cookie->store_engine_specific(cookie, NULL);
@@ -1505,9 +1511,8 @@ static ENGINE_ERROR_CODE handle_delete_bucket(ENGINE_HANDLE* handle,
             peh->state = STATE_STOPPING;
             spawn_bucket_destroyer(peh);
         }
-        must_unlock(&peh->lock);
+        release_handle_unlock(peh);
     }
-    release_handle(peh);
 
     if (found) {
         response("", 0, "", 0, "", 0, 0, 0, 0, cookie);
