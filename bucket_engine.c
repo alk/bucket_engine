@@ -652,7 +652,8 @@ static void release_engine_handle_locked(proxied_engine_handle_t *peh) {
         pthread_cond_signal(&peh->free_cond);
 }
 
-/* this must be called on handles returned from take_engine_handle. */
+/* This must be called on handles returned from take_engine_handle
+ * after completing access to underlying engine. */
 static void release_engine_handle(proxied_engine_handle_t *peh) {
     if (!peh)
         return;
@@ -1446,6 +1447,7 @@ static void *engine_destructor(void *arg) {
         if (peh->wants_disconnects) {
             peh->cb(cookie, ON_DISCONNECT, NULL, peh->cb_data);
         }
+        bucket_engine.upstream_server->cookie->notify_io_complete(cookie, ENGINE_DISCONNECT);
         bucket_engine.upstream_server->cookie->store_engine_specific(cookie, NULL);
         dequeue_connection(es);
         free(es);
