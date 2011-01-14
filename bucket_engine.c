@@ -594,11 +594,7 @@ static void dequeue_connection(engine_specific_t *es) {
     if (!peh)
         return;
     must_lock(&peh->lock);
-    /* HERE: the problem is that we don't wont to touch list fields
-     * under STATE_STOPPING, but we can encounter select bucket from
-     * dead bucket to live */
-    if (peh->state == STATE_RUNNING)
-        dequeue_connection_locked(es);
+    dequeue_connection_locked(es);
     release_handle_unlock(peh);
 }
 
@@ -638,9 +634,6 @@ static proxied_engine_handle_t *take_engine_handle(ENGINE_HANDLE *h,
 
     if (state != STATE_RUNNING) {
         must_unlock(&peh->lock);
-        e->upstream_server->cookie->store_engine_specific(cookie, NULL);
-        dequeue_connection(es);
-        free(es);
         return NULL;
     }
 
@@ -679,7 +672,13 @@ static proxied_engine_handle_t* set_engine_handle(ENGINE_HANDLE *h,
         e->upstream_server->cookie->store_engine_specific(cookie, es);
     }
     // out with the old
-    dequeue_connection(es);
+    if (es->peh) {
+        proxied_engine_handle_t *old_peh = es->peh;
+        must_lock(&old_peh->lock);
+        if (old_peh->state == STATE_RUNNING)
+            dequeue_connection_locked(es);
+        must_unlock(&old_peh->lock);
+    }
     // In with the new
     enqueue_connection(es, retain_handle(peh));
     return es->peh;
@@ -1430,7 +1429,6 @@ static void *engine_destructor(void *arg) {
     must_lock(&peh->lock);
     while (peh->bottom_refcnt)
         pthread_cond_wait(&peh->free_cond, &peh->lock);
-    must_unlock(&peh->lock);
     assert(peh->state == STATE_STOPPING);
     printf("Going to destroy engine for bucket %s\n", peh->name);
     /* at this point we know that old requests have completed and no
@@ -1439,23 +1437,29 @@ static void *engine_destructor(void *arg) {
 
     /* First we're responsible for calling disconnect callbacks for
      * all connections and freeing per-connection handles. */
-    /* We're doing this without locks because no one will enqueue new
-     * connections (find_bucket will give them NULL) and no one will
-     * dequeue connections because handle_disconnect explicitly does
-     * nothing when state is not "running". */
-    /* Not holding peh lock prevents find_bucket & friends from
-     * hanging on that lock */
     engine_specific_t *es;
     while ((es = peh->connections)) {
         const void *cookie = es->cookie;
+        /* We do disconnect and reset engine specific pointer under
+         * lock because select_bucket might arrive concurrently on
+         * that socket and we'd call set_engine_handle with new bucket
+         * trying to dequeue_connection from our current bucket. To
+         * prevent that we forget engine specific pointer
+         * first. notify_io_complete call is made here too because
+         * otherwise we could disconnect another bucket's connection
+         * after select_bucket arrived. */
+        bucket_engine.upstream_server->cookie->notify_io_complete(cookie, ENGINE_DISCONNECT);
+        bucket_engine.upstream_server->cookie->store_engine_specific(cookie, NULL);
+        dequeue_connection_locked(es);
+        /* actual disconnect callback is run without lock. */
+        must_unlock(&peh->lock);
+        free(es);
         if (peh->wants_disconnects) {
             peh->cb(cookie, ON_DISCONNECT, NULL, peh->cb_data);
         }
-        bucket_engine.upstream_server->cookie->notify_io_complete(cookie, ENGINE_DISCONNECT);
-        bucket_engine.upstream_server->cookie->store_engine_specific(cookie, NULL);
-        dequeue_connection(es);
-        free(es);
+        must_lock(&peh->lock);
     }
+    must_unlock(&peh->lock);
 
     /* Now we can destroy engine */
     peh->pe.v1->destroy(peh->pe.v0);
