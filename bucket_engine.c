@@ -5,10 +5,14 @@
 #include <dlfcn.h>
 #include <string.h>
 #include <pthread.h>
+/* TODO */
+#include <unistd.h>
 #ifndef WIN32
 #include <arpa/inet.h>
+#include <sys/socket.h>
 #else
 #include <winsock.h>
+#define SHUT_RDWR SD_BOTH
 #endif
 
 #include <assert.h>
@@ -29,6 +33,8 @@ typedef enum {
     STATE_RUNNING,
     STATE_STOPPING
 } bucket_state_t;
+
+struct engine_specific;
 
 typedef struct proxied_engine_handle {
     const char          *name;
@@ -51,11 +57,18 @@ typedef struct proxied_engine_handle {
                                     * some connection can hold
                                     * pointer longer) */
     volatile bucket_state_t state;
+
+    struct engine_specific *first;
 } proxied_engine_handle_t;
 
 typedef struct engine_specific {
+    const void *cookie;
     proxied_engine_handle_t *peh;
     void                    *engine_specific;
+
+    /* this pointers can be accessed under peh->lock */
+    struct engine_specific *next;
+    struct engine_specific **pprev;
 } engine_specific_t;
 
 struct bucket_engine {
@@ -589,7 +602,7 @@ static ENGINE_ERROR_CODE create_bucket(struct bucket_engine *e,
 /* Returns engine handle for this connection. Every access to
  * underlying engine must go through this function. */
 static proxied_engine_handle_t *get_engine_handle(ENGINE_HANDLE *h,
-                                                   const void *cookie) {
+                                                  const void *cookie) {
     struct bucket_engine *e = (struct bucket_engine*)h;
     engine_specific_t *es = e->upstream_server->cookie->get_engine_specific(cookie);
     if (!es) {
@@ -611,6 +624,46 @@ static proxied_engine_handle_t *get_engine_handle(ENGINE_HANDLE *h,
     return peh;
 }
 
+static proxied_engine_handle_t *enlist_connection(engine_specific_t *es,
+                                                  proxied_engine_handle_t *peh) {
+    proxied_engine_handle_t *rv = NULL;
+    if (peh == NULL) {
+        return NULL;
+    }
+    must_lock(&peh->lock);
+    if (peh->state == STATE_RUNNING) {
+        rv = peh;
+        es->peh = peh;
+        peh->refcount++;
+
+        es->next = peh->first;
+        es->pprev = &peh->first;
+        if (es->next) {
+            es->next->pprev = &es->next;
+        }
+        peh->first = es;
+    }
+    must_unlock(&peh->lock);
+    return rv;
+}
+
+static void delist_connection(engine_specific_t *es) {
+    proxied_engine_handle_t *peh = es->peh;
+    if (peh == NULL) {
+        return;
+    }
+    must_lock(&peh->lock);
+    engine_specific_t *next = es->next;
+    if (next) {
+        next->pprev = es->pprev;
+    }
+    *(es->pprev) = next;
+    es->peh = NULL;
+    release_handle_locked(peh);
+    must_unlock(&peh->lock);
+}
+
+
 static proxied_engine_handle_t* set_engine_handle(ENGINE_HANDLE *h,
                                                   const void *cookie,
                                                   proxied_engine_handle_t *peh) {
@@ -622,9 +675,10 @@ static proxied_engine_handle_t* set_engine_handle(ENGINE_HANDLE *h,
         e->upstream_server->cookie->store_engine_specific(cookie, es);
     }
     // out with the old
-    release_handle(es->peh);
+    delist_connection(es);
     // In with the new
-    es->peh = retain_handle(peh);
+    es->cookie = cookie;
+    es->peh = enlist_connection(es, peh);
     return es->peh;
 }
 
@@ -749,14 +803,18 @@ static void handle_disconnect(const void *cookie,
 
     engine_specific_t *es =
         e->upstream_server->cookie->get_engine_specific(cookie);
-    proxied_engine_handle_t *peh = es ? es->peh : NULL;
+    if (es == NULL) {
+        return;
+    }
+
+    proxied_engine_handle_t *peh = es->peh;
 
     if (peh && peh->wants_disconnects) {
         peh->cb(cookie, type, event_data, peh->cb_data);
     }
 
     // Free up the engine we were using.
-    release_handle(peh);
+    delist_connection(es);
     free(es);
     e->upstream_server->cookie->store_engine_specific(cookie, NULL);
 }
@@ -1354,6 +1412,26 @@ static bool do_delete_bucket(proxied_engine_handle_t *peh) {
     peh->refcount--;      /* drop our incoming reference */
     /* now drop main ref (due to STATE_RUNNING) */
     release_handle_locked(peh);
+
+    fprintf(stderr, "Before shutting down sockets. refcount = %d, peh->first=%p\n", peh->refcount, (void *)(peh->first));
+    fflush(stderr);
+
+    /* and rudely close all connections */
+    engine_specific_t *es = peh->first;
+    while (es) {
+        int fd = bucket_engine.upstream_server->cookie->get_socket_fd(es->cookie);
+        fprintf(stderr, "Shutting down fd: %d\n", fd);
+        fflush(stderr);
+        int rv = shutdown(fd, SHUT_RD);
+        fprintf(stderr, "rv = %d\n", rv);
+        rv = write(fd, &rv, sizeof(rv));
+        fprintf(stderr, "rv = %d\n", rv);
+        fflush(stderr);
+        es = es->next;
+    }
+
+    fprintf(stderr, "Going to wait: refcount = %d\n", peh->refcount);
+    fflush(stderr);
 
     /* wait till refcount reaches 1. 1 is our original reference */
     while (peh->refcount != 0) {
