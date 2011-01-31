@@ -41,6 +41,7 @@ typedef struct proxied_engine_handle {
     EVENT_CALLBACK       cb;
     const void          *cb_data;
     pthread_mutex_t      lock; /* guards everything below */
+    pthread_cond_t       free_to_die;
     int                  refcount; /* count of connections + 1 for
                                     * hashtable reference. Handle
                                     * itself can be freed when this
@@ -397,58 +398,11 @@ ENGINE_ERROR_CODE create_instance(uint64_t interface,
     return ENGINE_SUCCESS;
 }
 
-static void *engine_destroyer(void *arg) {
-    proxied_engine_handle_t *peh = arg;
-    assert(peh->state == STATE_STOPPING);
-    assert(peh->refcount == 0);
-    /* at this point we know that no connections holds reference to
-     * this bucket. The only place that still holds reference to that
-     * bucket is hashtable. But find_bucket will not return it because
-     * it's marked as STATE_STOPPING. So it's safe to destroy it */
-    peh->pe.v1->destroy(peh->pe.v0);
-
-    /* now we can delete it from hashtable */
-    lock_engines();
-
-    int upd = genhash_delete_all(bucket_engine.engines,
-                                 peh->name, peh->name_len);
-    assert(upd == 1);
-    assert(genhash_find(bucket_engine.engines,
-                        peh->name, peh->name_len) == NULL);
-    assert(peh->state == STATE_NULL);
-
-    unlock_engines();
-
-    /* to make sure release_handle unlocked peh before we free it, we
-     * briefly acquire lock again */
-    must_lock(&peh->lock);
-    must_unlock(&peh->lock);
-
-    /* and free it */
-    free_engine_handle(peh);
-
-    return NULL;
-}
-
 static void release_handle_locked(proxied_engine_handle_t *peh) {
     assert(peh->refcount > 0);
     if (--peh->refcount == 0) {
         assert(peh->state == STATE_STOPPING);
-
-        // We should never free the default engine.
-        assert(peh != &bucket_engine.default_engine);
-
-        pthread_attr_t attr;
-        if (pthread_attr_init(&attr) != 0 ||
-            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0) {
-            abort();
-        }
-
-        pthread_t tid;
-        if (pthread_create(&tid, &attr, engine_destroyer, peh) != 0) {
-            abort();
-        }
-        pthread_attr_destroy(&attr);
+        pthread_cond_signal(&peh->free_to_die);
     }
 }
 
@@ -462,16 +416,16 @@ static void release_handle(proxied_engine_handle_t *peh) {
     must_unlock(&peh->lock);
 }
 
-static proxied_engine_handle_t *find_bucket_inner(const char *name) {
+static proxied_engine_handle_t *get_bucket_inner(const char *name) {
     return genhash_find(bucket_engine.engines, name, strlen(name));
 }
 
 /* returns proxied_engine_handle_t for bucket with given name. This
  * increments refcount of returned handle, so caller is responsible
  * for calling release_handle on it. */
-static proxied_engine_handle_t *find_bucket(const char *name) {
+static proxied_engine_handle_t *get_bucket(const char *name) {
     lock_engines();
-    proxied_engine_handle_t *rv = find_bucket_inner(name);
+    proxied_engine_handle_t *rv = get_bucket_inner(name);
     if (rv) {
         pthread_mutex_t *lock = &rv->lock;
         must_lock(lock);
@@ -516,10 +470,12 @@ static void init_engine_handle(proxied_engine_handle_t *peh, const char *name) {
     peh->name = strdup(name);
     peh->name_len = strlen(peh->name);
     pthread_mutex_init(&peh->lock, NULL);
+    pthread_cond_init(&peh->free_to_die, NULL);
     peh->state = STATE_RUNNING;
 }
 
 static void free_engine_handle(proxied_engine_handle_t *peh) {
+    pthread_cond_destroy(&peh->free_to_die);
     pthread_mutex_destroy(&peh->lock);
     bucket_engine.upstream_server->stat->release_stats(peh->stats);
     free((void *)peh->name);
@@ -561,7 +517,7 @@ static ENGINE_ERROR_CODE create_bucket(struct bucket_engine *e,
 
     lock_engines();
 
-    proxied_engine_handle_t *tmppeh = find_bucket_inner(bucket_name);
+    proxied_engine_handle_t *tmppeh = get_bucket_inner(bucket_name);
     if (tmppeh == NULL) {
         genhash_update(e->engines, bucket_name, strlen(bucket_name), peh, 0);
 
@@ -788,7 +744,7 @@ static void handle_connect(const void *cookie,
     proxied_engine_handle_t *peh = NULL;
     if (e->default_bucket_name != NULL) {
         // Assign a default named bucket (if there is one).
-        peh = find_bucket(e->default_bucket_name);
+        peh = get_bucket(e->default_bucket_name);
         if (!peh && e->auto_create) {
             // XXX:  Need default config.
             create_bucket(e, e->default_bucket_name,
@@ -818,7 +774,7 @@ static void handle_auth(const void *cookie,
     struct bucket_engine *e = (struct bucket_engine*)cb_data;
 
     const auth_data_t *auth_data = (const auth_data_t*)event_data;
-    proxied_engine_handle_t *peh = find_bucket(auth_data->username);
+    proxied_engine_handle_t *peh = get_bucket(auth_data->username);
     if (!peh && e->auto_create) {
         create_bucket(e, auth_data->username, e->default_engine_path,
                       auth_data->config ? auth_data->config : "", &peh, NULL, 0);
@@ -1322,6 +1278,7 @@ static ENGINE_ERROR_CODE handle_create_bucket(ENGINE_HANDLE* handle,
 
     const size_t msglen = 1024;
     char msg[msglen];
+    msg[0] = 0;
     ENGINE_ERROR_CODE ret = create_bucket(e, keyz, spec,
                                           config ? config : "",
                                           NULL, msg, msglen);
@@ -1344,6 +1301,52 @@ static ENGINE_ERROR_CODE handle_create_bucket(ENGINE_HANDLE* handle,
     return ENGINE_SUCCESS;
 }
 
+/* Must be called with increased refcnt, this reference will be
+ * atomically dropped. Returns true if bucket was deleted. */
+static bool do_delete_bucket(proxied_engine_handle_t *peh) {
+    must_lock(&peh->lock);
+    if (peh->state != STATE_RUNNING) {
+        /* someone deleted bucket before us. Drop ref and exit */
+        release_handle_locked(peh);
+        must_unlock(&peh->lock);
+        return false;
+    }
+
+    peh->state = STATE_STOPPING;
+    peh->refcount--;      /* drop our incoming reference */
+    /* now drop main ref (due to STATE_RUNNING) */
+    release_handle_locked(peh);
+
+    /* wait till refcount reaches 1. 1 is our original reference */
+    while (peh->refcount != 0) {
+        pthread_cond_wait(&peh->free_to_die, &peh->lock);
+    }
+    /* at this point no connection holds reference to this bucket and
+     * get_bucket will not find it because it's marked as
+     * STATE_STOPPING, so we can drop lock. */
+    must_unlock(&peh->lock);
+
+    /* now we can delete it from hashtable */
+    lock_engines();
+
+    int upd = genhash_delete_all(bucket_engine.engines,
+                                 peh->name, peh->name_len);
+    assert(upd == 1);
+    assert(genhash_find(bucket_engine.engines,
+                        peh->name, peh->name_len) == NULL);
+    assert(peh->state == STATE_NULL);
+
+    unlock_engines();
+
+    /* at this point we know that nobody else holds reference to
+     * this bucket. So it's safe to destroy it */
+    peh->pe.v1->destroy(peh->pe.v0);
+
+    /* and free it */
+    free_engine_handle(peh);
+    return true;
+}
+
 static ENGINE_ERROR_CODE handle_delete_bucket(ENGINE_HANDLE* handle,
                                               const void* cookie,
                                               protocol_binary_request_header *request,
@@ -1355,17 +1358,18 @@ static ENGINE_ERROR_CODE handle_delete_bucket(ENGINE_HANDLE* handle,
     EXTRACT_KEY(breq, keyz);
 
     bool found = false;
-    proxied_engine_handle_t *peh = find_bucket(keyz);
+    proxied_engine_handle_t *peh = get_bucket(keyz);
 
     if (peh) {
-        must_lock(&peh->lock);
-        if (peh->state == STATE_RUNNING) {
-            found = true;
-            peh->state = STATE_STOPPING;
-            /* now drop main ref */
-            release_handle_locked(peh);
+        proxied_engine_handle_t *mine = get_engine_handle(handle, cookie);
+        if (mine == peh) {
+            set_engine_handle(handle, cookie, NULL);
         }
-        must_unlock(&peh->lock);
+
+        found = do_delete_bucket(peh);
+        /* bucket delete attempt drops refcnt, so we forget peh
+         * reference */
+        peh = NULL;
     }
     release_handle(peh);
 
@@ -1450,7 +1454,7 @@ static ENGINE_ERROR_CODE handle_expand_bucket(ENGINE_HANDLE* handle,
 
     EXTRACT_KEY(breq, keyz);
 
-    proxied_engine_handle_t *proxied = find_bucket(keyz);
+    proxied_engine_handle_t *proxied = get_bucket(keyz);
 
     ENGINE_ERROR_CODE rv = ENGINE_SUCCESS;
     if (proxied) {
@@ -1475,7 +1479,7 @@ static ENGINE_ERROR_CODE handle_select_bucket(ENGINE_HANDLE* handle,
 
     EXTRACT_KEY(breq, keyz);
 
-    proxied_engine_handle_t *proxied = find_bucket(keyz);
+    proxied_engine_handle_t *proxied = get_bucket(keyz);
     set_engine_handle(handle, cookie, proxied);
     release_handle(proxied);
 

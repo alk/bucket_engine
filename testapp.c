@@ -780,6 +780,26 @@ static enum test_result test_admin_user(ENGINE_HANDLE *h,
     return SUCCESS;
 }
 
+struct delete_bucket_args {
+    ENGINE_HANDLE_V1 *h1;
+    ENGINE_HANDLE *h;
+    const void *adm_cookie;
+};
+
+static void *test_delete_bucket_internals(void *_args) {
+    struct delete_bucket_args *args = _args;
+    ENGINE_HANDLE_V1 *h1 = args->h1;
+    ENGINE_ERROR_CODE rv;
+    void *pkt;
+
+    pkt = create_packet(DELETE_BUCKET, "someuser", "");
+    rv = h1->unknown_command(args->h, args->adm_cookie, pkt, add_response);
+    free(pkt);
+    assert(rv == ENGINE_SUCCESS);
+
+    return 0;
+}
+
 static enum test_result test_delete_bucket(ENGINE_HANDLE *h,
                                            ENGINE_HANDLE_V1 *h1) {
     const void *adm_cookie = mk_conn("admin", NULL);
@@ -802,10 +822,22 @@ static enum test_result test_delete_bucket(ENGINE_HANDLE *h,
                       strlen(value), 9258, 3600);
     assert(rv == ENGINE_SUCCESS);
 
-    pkt = create_packet(DELETE_BUCKET, "someuser", "");
-    rv = h1->unknown_command(h, adm_cookie, pkt, add_response);
-    free(pkt);
-    assert(rv == ENGINE_SUCCESS);
+    struct delete_bucket_args args = {.h1 = h1, .h = h, .adm_cookie = adm_cookie};
+    pthread_t thread;
+    int irv = pthread_create(&thread, NULL, test_delete_bucket_internals, &args);
+    assert(irv == 0);
+
+    /*
+     * we're racing with bucket deletion marking bucket as dead on one
+     * side. On the other side bucket deletion wait's till last
+     * connection dies
+     */
+    sleep(1);
+
+    rv = h1->allocate(h, other_cookie, &itm,
+                      key, strlen(key),
+                      strlen(value), 9258, 3600);
+    assert(rv == ENGINE_DISCONNECT);
 
     pkt = create_packet(DELETE_BUCKET, "someuser", "");
     rv = h1->unknown_command(h, adm_cookie, pkt, add_response);
@@ -813,10 +845,8 @@ static enum test_result test_delete_bucket(ENGINE_HANDLE *h,
     assert(rv == ENGINE_SUCCESS);
     assert(last_status == PROTOCOL_BINARY_RESPONSE_KEY_ENOENT);
 
-    rv = h1->allocate(h, other_cookie, &itm,
-                      key, strlen(key),
-                      strlen(value), 9258, 3600);
-    assert(rv == ENGINE_DISCONNECT);
+    irv = pthread_join(thread, NULL);
+    assert(irv == 0);
 
     return SUCCESS;
 }
