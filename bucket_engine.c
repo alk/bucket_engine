@@ -463,22 +463,44 @@ static bool has_valid_bucket_name(const char *n) {
 }
 
 /* fills engine handle. Assumes that it's zeroed already */
-static void init_engine_handle(proxied_engine_handle_t *peh, const char *name) {
+static ENGINE_ERROR_CODE init_engine_handle(proxied_engine_handle_t *peh, const char *name) {
+    ENGINE_ERROR_CODE rv;
+
     peh->stats = bucket_engine.upstream_server->stat->new_stats();
     assert(peh->stats);
     peh->refcount = 1;
     peh->name = strdup(name);
+    if (peh->name == NULL) {
+        return ENGINE_ENOMEM;
+    }
     peh->name_len = strlen(peh->name);
-    pthread_mutex_init(&peh->lock, NULL);
-    pthread_cond_init(&peh->free_to_die, NULL);
+    if (pthread_mutex_init(&peh->lock, NULL) != 0) {
+        rv = ENGINE_FAILED;
+        goto out_free;
+    }
+    if (pthread_cond_init(&peh->free_to_die, NULL) != 0) {
+        rv = ENGINE_FAILED;
+        goto out_mutex;
+    }
     peh->state = STATE_RUNNING;
+    return ENGINE_SUCCESS;
+
+out_mutex:
+    pthread_mutex_destroy(&peh->lock);
+out_free:
+    free((void *)(peh->name));
+    return rv;
 }
 
-static void free_engine_handle(proxied_engine_handle_t *peh) {
+static void uninit_engine_handle(proxied_engine_handle_t *peh) {
     pthread_cond_destroy(&peh->free_to_die);
     pthread_mutex_destroy(&peh->lock);
     bucket_engine.upstream_server->stat->release_stats(peh->stats);
     free((void *)peh->name);
+}
+
+static void free_engine_handle(proxied_engine_handle_t *peh) {
+    uninit_engine_handle(peh);
     free(peh);
 }
 
@@ -491,17 +513,23 @@ static ENGINE_ERROR_CODE create_bucket(struct bucket_engine *e,
                                        proxied_engine_handle_t **e_out,
                                        char *msg, size_t msglen) {
 
+    ENGINE_ERROR_CODE rv;
+
     if (!has_valid_bucket_name(bucket_name)) {
         return ENGINE_EINVAL;
     }
 
     proxied_engine_handle_t *peh = calloc(sizeof(proxied_engine_handle_t), 1);
     if (peh == NULL) {
-        return ENGINE_FAILED;
+        return ENGINE_ENOMEM;
     }
-    init_engine_handle(peh, bucket_name);
+    rv = init_engine_handle(peh, bucket_name);
+    if (rv != ENGINE_SUCCESS) {
+        free(peh);
+        return rv;
+    }
 
-    ENGINE_ERROR_CODE rv = ENGINE_FAILED;
+    rv = ENGINE_FAILED;
 
     must_lock(&bucket_engine.dlopen_mutex);
     peh->pe.v0 = load_engine(path, NULL, NULL);
@@ -823,17 +851,19 @@ static ENGINE_ERROR_CODE bucket_initialize(ENGINE_HANDLE* handle,
     // shut it down if not.
     if (se->has_default) {
         memset(&se->default_engine, 0, sizeof(se->default_engine));
-        init_engine_handle(&se->default_engine, "");
+        if (init_engine_handle(&se->default_engine, "") != ENGINE_SUCCESS) {
+            goto out_genhash;
+        }
         se->default_engine.pe.v0 = load_engine(se->default_engine_path, NULL, NULL);
 
         ENGINE_HANDLE_V1 *dv1 = (ENGINE_HANDLE_V1*)se->default_engine.pe.v0;
         if (!dv1) {
-            return ENGINE_FAILED;
+            goto out_genhash;
         }
 
         if (dv1->initialize(se->default_engine.pe.v0, config_str) != ENGINE_SUCCESS) {
             dv1->destroy(se->default_engine.pe.v0);
-            return ENGINE_FAILED;
+            goto out_genhash;
         }
     }
 
@@ -846,12 +876,20 @@ static ENGINE_ERROR_CODE bucket_initialize(ENGINE_HANDLE* handle,
 
     se->initialized = true;
     return ENGINE_SUCCESS;
+
+out_genhash:
+    genhash_free(se->engines);
+    return ENGINE_FAILED;
 }
 
 static void bucket_destroy(ENGINE_HANDLE* handle) {
     struct bucket_engine* se = get_handle(handle);
 
     if (se->initialized) {
+        if (se->has_default) {
+            uninit_engine_handle(&se->default_engine);
+        }
+
         genhash_free(se->engines);
         se->engines = NULL;
         free(se->default_engine_path);
