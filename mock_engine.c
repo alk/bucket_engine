@@ -54,7 +54,7 @@ ENGINE_ERROR_CODE create_instance(uint64_t interface,
 static const engine_info* mock_get_info(ENGINE_HANDLE* handle);
 static ENGINE_ERROR_CODE mock_initialize(ENGINE_HANDLE* handle,
                                          const char* config_str);
-static void mock_destroy(ENGINE_HANDLE* handle);
+static void mock_destroy(ENGINE_HANDLE* handle, const bool);
 static ENGINE_ERROR_CODE mock_item_allocate(ENGINE_HANDLE* handle,
                                             const void* cookie,
                                             item **item,
@@ -284,7 +284,8 @@ static ENGINE_ERROR_CODE mock_initialize(ENGINE_HANDLE* handle,
     return ENGINE_SUCCESS;
 }
 
-static void mock_destroy(ENGINE_HANDLE* handle) {
+static void mock_destroy(ENGINE_HANDLE* handle, const bool force) {
+    (void)force;
     struct mock_engine* se = get_handle(handle);
 
     if (se->initialized) {

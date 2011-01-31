@@ -108,7 +108,7 @@ static const char *get_default_bucket_config(void);
 
 static ENGINE_ERROR_CODE bucket_initialize(ENGINE_HANDLE* handle,
                                            const char* config_str);
-static void bucket_destroy(ENGINE_HANDLE* handle);
+static void bucket_destroy(ENGINE_HANDLE* handle, const bool force);
 static ENGINE_ERROR_CODE bucket_item_allocate(ENGINE_HANDLE* handle,
                                               const void* cookie,
                                               item **item,
@@ -568,7 +568,7 @@ static ENGINE_ERROR_CODE create_bucket(struct bucket_engine *e,
         rv = ENGINE_SUCCESS;
 
         if (peh->pe.v1->initialize(peh->pe.v0, config) != ENGINE_SUCCESS) {
-            peh->pe.v1->destroy(peh->pe.v0);
+            peh->pe.v1->destroy(peh->pe.v0, false);
             genhash_delete_all(e->engines, bucket_name, strlen(bucket_name));
             if (msg) {
                 snprintf(msg, msglen,
@@ -778,7 +778,7 @@ static ENGINE_HANDLE *load_engine(const char *soname, const char *config_str,
         if (engine->interface == 1) {
             ENGINE_HANDLE_V1 *v1 = (ENGINE_HANDLE_V1*)engine;
             if (v1->initialize(engine, config_str) != ENGINE_SUCCESS) {
-                v1->destroy(engine);
+                v1->destroy(engine, false);
                 fprintf(stderr, "Failed to initialize instance. Error code: %d\n",
                         error);
                 dlclose(handle);
@@ -920,7 +920,7 @@ static ENGINE_ERROR_CODE bucket_initialize(ENGINE_HANDLE* handle,
         }
 
         if (dv1->initialize(se->default_engine.pe.v0, config_str) != ENGINE_SUCCESS) {
-            dv1->destroy(se->default_engine.pe.v0);
+            dv1->destroy(se->default_engine.pe.v0, false);
             goto out_genhash;
         }
     }
@@ -940,7 +940,8 @@ out_genhash:
     return ENGINE_FAILED;
 }
 
-static void bucket_destroy(ENGINE_HANDLE* handle) {
+static void bucket_destroy(ENGINE_HANDLE* handle, const bool force) {
+    (void)force;
     struct bucket_engine* se = get_handle(handle);
 
     if (se->initialized) {
@@ -1456,7 +1457,7 @@ static bool do_delete_bucket(proxied_engine_handle_t *peh) {
 
     /* at this point we know that nobody else holds reference to
      * this bucket. So it's safe to destroy it */
-    peh->pe.v1->destroy(peh->pe.v0);
+    peh->pe.v1->destroy(peh->pe.v0, true);
 
     /* and free it */
     free_engine_handle(peh);
