@@ -204,6 +204,8 @@ static bool authorized(ENGINE_HANDLE* handle, const void* cookie);
 
 static void free_engine_handle(proxied_engine_handle_t *);
 
+static EXTENSION_LOGGER_DESCRIPTOR *logger;
+
 struct bucket_engine bucket_engine = {
     .engine = {
         .interface = {
@@ -394,6 +396,8 @@ ENGINE_ERROR_CODE create_instance(uint64_t interface,
     bucket_engine.extension_api.unregister_extension = bucket_unregister_extension;
     bucket_engine.extension_api.get_extension = bucket_get_extension;
     bucket_engine.server.extension = &bucket_engine.extension_api;
+
+    logger = (EXTENSION_LOGGER_DESCRIPTOR*)(bucket_engine.extension_api.get_extension(EXTENSION_LOGGER));
 
     /* Override engine specific */
     bucket_engine.cookie_api = *bucket_engine.upstream_server->cookie;
@@ -740,18 +744,19 @@ static ENGINE_HANDLE *load_engine(const char *soname, const char *config_str,
     void *handle = dlopen(soname, RTLD_NOW | RTLD_LOCAL);
     if (handle == NULL) {
         const char *msg = dlerror();
-        fprintf(stderr, "Failed to open library \"%s\": %s\n",
-                soname ? soname : "self",
-                msg ? msg : "unknown error");
+        logger->log(EXTENSION_LOG_WARNING, NULL,
+                    "Failed to open library \"%s\": %s\n",
+                    soname ? soname : "self",
+                    msg ? msg : "unknown error");
         return NULL;
     }
 
     void *symbol = dlsym(handle, "create_instance");
     if (symbol == NULL) {
-        fprintf(stderr,
-                "Could not find symbol \"create_instance\" in %s: %s\n",
-                soname ? soname : "self",
-                dlerror());
+        logger->log(EXTENSION_LOG_WARNING, NULL,
+                    "Could not find symbol \"create_instance\" in %s: %s\n",
+                    soname ? soname : "self",
+                    dlerror());
         return NULL;
     }
     my_create.voidptr = symbol;
@@ -765,7 +770,8 @@ static ENGINE_HANDLE *load_engine(const char *soname, const char *config_str,
                                                   &engine);
 
     if (error != ENGINE_SUCCESS || engine == NULL) {
-        fprintf(stderr, "Failed to create instance. Error code: %d\n", error);
+        logger->log(EXTENSION_LOG_WARNING, NULL,
+                    "Failed to create instance. Error code: %d\n", error);
         dlclose(handle);
         return NULL;
     }
@@ -775,13 +781,15 @@ static ENGINE_HANDLE *load_engine(const char *soname, const char *config_str,
             ENGINE_HANDLE_V1 *v1 = (ENGINE_HANDLE_V1*)engine;
             if (v1->initialize(engine, config_str) != ENGINE_SUCCESS) {
                 v1->destroy(engine, false);
-                fprintf(stderr, "Failed to initialize instance. Error code: %d\n",
-                        error);
+                logger->log(EXTENSION_LOG_WARNING, NULL,
+                            "Failed to initialize instance. Error code: %d\n",
+                            error);
                 dlclose(handle);
                 return NULL;
             }
         } else {
-            fprintf(stderr, "Unsupported interface level\n");
+            logger->log(EXTENSION_LOG_WARNING, NULL,
+                        "Unsupported interface level\n");
             dlclose(handle);
             return NULL;
         }
@@ -868,22 +876,26 @@ static ENGINE_ERROR_CODE bucket_initialize(ENGINE_HANDLE* handle,
     assert(!se->initialized);
 
     if (pthread_mutex_init(&se->engines_mutex, NULL) != 0) {
-        fprintf(stderr, "Error initializing mutex for bucket engine.\n");
+        logger->log(EXTENSION_LOG_WARNING, NULL,
+                    "Error initializing mutex for bucket engine.\n");
         return ENGINE_FAILED;
     }
 
     if (pthread_mutex_init(&se->dlopen_mutex, NULL) != 0) {
-        fprintf(stderr, "Error initializing mutex for bucket engine dlopen.\n");
+        logger->log(EXTENSION_LOG_WARNING, NULL,
+                    "Error initializing mutex for bucket engine dlopen.\n");
         return ENGINE_FAILED;
     }
 
     if (pthread_mutex_init(&se->destroy_count_mutex, NULL) != 0) {
-        fprintf(stderr, "Error initializing mutex for bucket destroy_count.\n");
+        logger->log(EXTENSION_LOG_WARNING, NULL,
+                    "Error initializing mutex for bucket destroy_count.\n");
         return ENGINE_FAILED;
     }
 
     if (pthread_cond_init(&se->destroy_count_zero, NULL) != 0) {
-        fprintf(stderr, "Error condition variable for bucket destroy_count == 0.\n");
+        logger->log(EXTENSION_LOG_WARNING, NULL,
+                    "Error condition variable for bucket destroy_count == 0.\n");
         return ENGINE_FAILED;
     }
 
