@@ -185,6 +185,11 @@ static void *get_engine_specific(const void *cookie) {
     return c ? c->engine_data : NULL;
 }
 
+static int get_socket_fd(const void *cookie) {
+    (void)cookie;
+    return -1;
+}
+
 static void *create_stats(void) {
     /* XXX: Not sure if ``big buffer'' is right in faking this part of
        the server. */
@@ -218,7 +223,7 @@ static SERVER_HANDLE_V1 *get_server_api(void)
         .get_auth_data = get_auth_data,
         .store_engine_specific = store_engine_specific,
         .get_engine_specific = get_engine_specific,
-        // .get_socket_fd = get_socket_fd,
+        .get_socket_fd = get_socket_fd,
         // .notify_io_complete = notify_io_complete,
     };
 
