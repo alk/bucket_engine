@@ -1312,14 +1312,66 @@ static void* hash_strdup(const void *x, size_t n) {
     return memcpy(rv, x, n);
 }
 
+static
+pid_t testapp_fork(void)
+{
+#ifndef USE_GCOV
+    if (getenv("DONT_FORK")) {
+        return 1;
+    }
+    if (getenv("GDB_DONT_FORK")) {
+        return 1;
+    }
+    return fork();
+#else
+    return 1;
+#endif
+}
+
+static
+int last_rv;
+
+static
+void testapp_exit(int rv)
+{
+    last_rv = rv;
+#ifndef USE_GCOV
+    if (getenv("DONT_FORK") != NULL) {
+        exit(rv);
+    }
+#endif
+}
+
+static
+int testapp_waitpid(pid_t pid, int *pret, int dummy) {
+#ifndef USE_GCOV
+    if (getenv("DONT_FORK") == NULL) {
+        return waitpid(pid, pret, dummy);
+    }
+#endif
+    *pret = last_rv;
+    return 0;
+}
+
+static
+int testapp_wexitstatus(int status) {
+#ifndef USE_GCOV
+    if (getenv("DONT_FORK") == NULL) {
+        if (!WIFEXITED(status)) {
+            return 0;
+        }
+        return WEXITSTATUS(status);
+    }
+#endif
+    return SUCCESS;
+}
+
 static enum test_result run_test(struct test test) {
     enum test_result ret = PENDING;
     if (test.tfun != NULL) {
         last_status = 0xff;
-#ifndef USE_GCOV
-        pid_t pid = fork();
+        pid_t pid = testapp_fork();
         if (pid == 0) {
-#endif
             /* Initialize the stats collection thingy */
             struct hash_ops stats_hash_ops = {
                 .hashfunc = genhash_string_hash,
@@ -1339,27 +1391,25 @@ static enum test_result run_test(struct test test) {
             connstructs = NULL;
             h->destroy((ENGINE_HANDLE*)h, false);
             genhash_free(stats_hash);
-#ifndef USE_GCOV
-            exit((int)ret);
+            testapp_exit((int)ret);
         } else if (pid == (pid_t)-1) {
             ret = FAIL;
         } else {
             int rc;
-            while (waitpid(pid, &rc, 0) == (pid_t)-1) {
+            while (testapp_waitpid(pid, &rc, 0) == (pid_t)-1) {
                 if (errno != EINTR) {
                     abort();
                 }
             }
 
-            if (WIFEXITED(rc)) {
-                ret = (enum test_result)WEXITSTATUS(rc);
+            if ((ret = testapp_wexitstatus(rc))) {
+                /* ret is already assigned */
             } else if (WIFSIGNALED(rc) && WCOREDUMP(rc)) {
                 ret = CORE;
             } else {
                 ret = DIED;
             }
         }
-#endif
     }
 
     return ret;
