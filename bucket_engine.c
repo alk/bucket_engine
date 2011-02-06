@@ -223,8 +223,6 @@ static void free_engine_handle(proxied_engine_handle_t *);
 static bool list_buckets(struct bucket_engine *e, struct bucket_list **blist);
 static void bucket_list_free(struct bucket_list *blist);
 
-static void handle_es_disconnect(engine_specific_t *es, bool invoke_cb);
-
 struct bucket_engine bucket_engine = {
     .engine = {
         .interface = {
@@ -670,7 +668,6 @@ static proxied_engine_handle_t *get_engine_handle(ENGINE_HANDLE *h,
     proxied_engine_handle_t *peh = es->peh;
 
     if (peh->state != STATE_RUNNING) {
-        handle_es_disconnect(es, false);
         return NULL;
     }
 
