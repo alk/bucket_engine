@@ -1,0 +1,77 @@
+How bucket removal synchronization works
+----------------------------------------
+
+Bucket engine handles keep track of connections to this bucket. See
+->first field of proxied_engine_handle_t. Functions that manipulate
+this list are: enlist_connection & handle_es_disconnect. As well as
+actual bucket deletion of course.
+
+We use a number of states and submit_to_all_workers API of memcached
+to synchronize state changes across worker threads. We exploit the
+fact that single worker request is not interruptible and to reach
+submit_to_all_workers completion callback each worker must complete
+it's current work first.
+
+State changes as well as list of connections are protected by bucket
+lock (i.e. peh->lock).
+
+Removal starts in STATE_STOPPING. Transition to this state
+synchronizes connections racing to remove given bucket. Once this
+state is set _new_ connections that try to connect to this bucket will
+not see it (see find_bucket). New requests to existing connections
+also check bucket state (see get_engine_handle) and will also not
+reach underlying engine.
+
+When state is set to STATE_STOPPING we use submit_to_all_workers to
+ensure that next phase starts after all current requests complete and
+that further request from memcached will see STATE_STOPPING (or
+greater) state. We can say that we've reached 'stable' (i.e. globally
+visible) STATE_STOPPING.
+
+The only up-call from memcached that may reach underlying engine is
+ON_DISCONNECT callback. This is fine because ON_DISCONNECT callback
+wrapper in bucket engine (handle_es_disconnect) takes lock and removes
+connection from list of bucket's connections. See handle_es_disconnect
+for more details.
+
+So in STATE_STOPPING new connections cannot be added to bucket handle,
+but existing connections can still be removed. And only underlying
+engine code that may run is it's ON_DISCONNECT callback.
+
+After we've reached 'stable' STATE_STOPPING we check and potentially
+wait till all ewouldblock requests complete.
+
+In in bucket_delete_continuation callback which is called next we set
+state to STATE_DISCONNECTING. In this state attempts to dequeue bucket
+tap connections will block. This is necessary to ensure that
+ON_DISCONNECT callbacks that we're going to call in this state see
+correct memcached cookies and that set_engine_specific works.
+
+After setting STATE_DISCONNECTING we iterate list of connections and
+invoke ON_DISCONNECT callback and notify_io_complete with status code
+ENGINE_DISCONNECT. This is to ensure that a) all callbacks of
+underlying engine that must be invoked are invoked b) ewouldblock &
+tap sockets of this bucket are disconnected.
+
+We don't invoke ON_DISCONNECT collbacks on normal connections, we
+pretend that somebody switched current bucket on them. Trying to do
+that may lead to deadlock, because we would be forced to delay
+select_bucket out of this bucket, but this thing executes with
+memcached thread lock held.
+
+Note that some ON_DISCONNECT callbacks can still be invoked from
+handle_es_disconnect if that concurrent call managed to dequeue it's
+connection before STATE_DISCONNECTING was set.
+
+After invoking all ON_DISCONNECT callbacks of underlying engine we can
+set state to STATE_STOPPING and unblock all handle_es_disconnect calls
+that were blocked to keep memcached cookies actual.
+
+And after that we invoke submit_to_all_workers second time. This is to
+ensure that concurrent ON_DISCONNECT callbacks of bucket engine
+complete.
+
+In completion callback from second submit_to_all_workers invocation
+(bucket_delete_continuation) we are sure that all necessary callbacks
+were invoked and bucket is completely quiet. We can finally destroy
+and free it.

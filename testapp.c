@@ -69,6 +69,9 @@ struct engine_event_handler {
 
 static struct connstruct *connstructs;
 
+static void (*queued_work_fn)(void *);
+static void *queued_work_data;
+
 static struct engine_event_handler *engine_event_handlers[MAX_ENGINE_EVENT_TYPE + 1];
 
 #define xisspace(c) isspace((unsigned char)c)
@@ -185,6 +188,29 @@ static void *get_engine_specific(const void *cookie) {
     return c ? c->engine_data : NULL;
 }
 
+static bool submit_to_all_workers(void (*fn)(void *), void *fn_data,
+                                  void (*completion_fn)(void *), void *completion_data) {
+    assert(fn == NULL);
+    assert(fn_data == NULL);
+    assert(queued_work_fn == NULL);
+    queued_work_fn = completion_fn;
+    queued_work_data = completion_data;
+    return true;
+}
+
+static void do_submitted_work(void) {
+    assert(queued_work_fn != NULL);
+    void (*fn)(void *) = queued_work_fn;
+    queued_work_fn = NULL;
+    fn(queued_work_data);
+}
+
+static void notify_io_complete(const void *cookie,
+                              ENGINE_ERROR_CODE code) {
+    (void)cookie;
+    (void)code;
+}
+
 static void *create_stats(void) {
     /* XXX: Not sure if ``big buffer'' is right in faking this part of
        the server. */
@@ -211,7 +237,8 @@ static SERVER_HANDLE_V1 *get_server_api(void)
         // .hash = hash,
         // .realtime = realtime,
         // .get_current_time = get_current_time,
-        .parse_config = parse_config
+        .parse_config = parse_config,
+        .submit_to_all_workers = submit_to_all_workers,
     };
 
     static SERVER_COOKIE_API cookie_api = {
@@ -219,7 +246,7 @@ static SERVER_HANDLE_V1 *get_server_api(void)
         .store_engine_specific = store_engine_specific,
         .get_engine_specific = get_engine_specific,
         // .get_socket_fd = get_socket_fd,
-        // .notify_io_complete = notify_io_complete,
+        .notify_io_complete = notify_io_complete
     };
 
     static SERVER_STAT_API server_stat_api = {
@@ -813,10 +840,14 @@ static enum test_result test_delete_bucket(ENGINE_HANDLE *h,
     assert(rv == ENGINE_SUCCESS);
     assert(last_status == PROTOCOL_BINARY_RESPONSE_KEY_ENOENT);
 
+    do_submitted_work();
+
     rv = h1->allocate(h, other_cookie, &itm,
                       key, strlen(key),
                       strlen(value), 9258, 3600);
     assert(rv == ENGINE_DISCONNECT);
+
+    do_submitted_work();
 
     return SUCCESS;
 }
@@ -911,6 +942,9 @@ static enum test_result test_delete_bucket_concurrent(ENGINE_HANDLE *h,
         int r = pthread_join(threads[i], &trv);
         assert(r == 0);
     }
+
+    do_submitted_work();
+    do_submitted_work();
 
     return SUCCESS;
 }
@@ -1336,6 +1370,7 @@ static enum test_result run_test(struct test test) {
             ret = test.tfun((ENGINE_HANDLE*)h, h);
             disconnect_all_connections(connstructs);
             destroy_event_handlers();
+            assert(queued_work_fn == NULL);
             connstructs = NULL;
             h->destroy((ENGINE_HANDLE*)h, false);
             genhash_free(stats_hash);

@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include <string.h>
 #include <pthread.h>
+#include <sched.h>
 #ifndef WIN32
 #include <arpa/inet.h>
 #else
@@ -27,7 +28,10 @@ typedef union proxied_engine {
 typedef enum {
     STATE_NULL,
     STATE_RUNNING,
-    STATE_STOPPING
+    STATE_STOPPING,
+    STATE_WAIT_EWOULDBLOCK,
+    STATE_DISCONNECTING,
+    STATE_STOPPED
 } bucket_state_t;
 
 struct engine_specific;
@@ -55,6 +59,8 @@ typedef struct proxied_engine_handle {
                                     * pointer longer) */
     int                  ewouldblock_count;
     volatile bucket_state_t state;
+
+    pthread_cond_t stopped_state_cond;
 
     struct engine_specific *first;
 } proxied_engine_handle_t;
@@ -225,6 +231,7 @@ static void free_engine_handle(proxied_engine_handle_t *);
 
 static bool list_buckets(struct bucket_engine *e, struct bucket_list **blist);
 static void bucket_list_free(struct bucket_list *blist);
+static void bucket_delete_continuation(void *_peh);
 
 struct bucket_engine bucket_engine = {
     .engine = {
@@ -287,12 +294,30 @@ static void unlock_engines(void)
     must_unlock(&bucket_engine.engines_mutex);
 }
 
+/* this is called in few places where malloc failure is simply not an
+ * option. Our strategy is to keep trying. */
+static void must_submit_to_all_workers(void (*fn)(void *), void *fn_data,
+                                       void (*completion_cb)(void *), void *cb_data) {
+    do {
+        bool ok = bucket_engine.upstream_server
+            ->core->submit_to_all_workers(fn, fn_data,
+                                          completion_cb, cb_data);
+        if (ok) {
+            break;
+        }
+        sched_yield();
+    } while (1);
+}
+
 static const char * bucket_state_name(bucket_state_t s) {
     const char * rv = NULL;
     switch(s) {
     case STATE_NULL: rv = "NULL"; break;
     case STATE_RUNNING: rv = "running"; break;
     case STATE_STOPPING: rv = "stopping"; break;
+    case STATE_WAIT_EWOULDBLOCK: rv = "wait_ewouldblock"; break;
+    case STATE_DISCONNECTING: rv = "disconnecting"; break;
+    case STATE_STOPPED: rv = "stopped"; break;
     }
     assert(rv);
     return rv;
@@ -375,6 +400,16 @@ static void* bucket_get_engine_specific(const void *cookie) {
     return es ? es->engine_specific : NULL;
 }
 
+static void bucket_notify_io_complete(const void *cookie,
+                                      ENGINE_ERROR_CODE status) {
+    engine_specific_t *es = bucket_engine.upstream_server->cookie->get_engine_specific(cookie);
+    if (!es || (es->tap && es->peh->state != STATE_RUNNING)) {
+        return;
+    }
+
+    bucket_engine.upstream_server->cookie->notify_io_complete(cookie, status);
+}
+
 static bool bucket_register_extension(extension_type_t type,
                                       void *extension) {
     (void)type;
@@ -422,73 +457,9 @@ ENGINE_ERROR_CODE create_instance(uint64_t interface,
     bucket_engine.server.cookie = &bucket_engine.cookie_api;
     bucket_engine.server.cookie->store_engine_specific = bucket_store_engine_specific;
     bucket_engine.server.cookie->get_engine_specific = bucket_get_engine_specific;
+    bucket_engine.server.cookie->notify_io_complete = bucket_notify_io_complete;
 
     return ENGINE_SUCCESS;
-}
-
-static void *engine_destroyer(void *arg) {
-    proxied_engine_handle_t *peh = arg;
-    assert(peh->state == STATE_STOPPING);
-    assert(peh->refcount == 0);
-    /* at this point we know that no connections holds reference to
-     * this bucket. The only place that still holds reference to that
-     * bucket is hashtable. But find_bucket will not return it because
-     * it's marked as STATE_STOPPING. So it's safe to destroy it */
-    peh->pe.v1->destroy(peh->pe.v0, peh->force_shutdown);
-
-    /* now we can delete it from hashtable */
-    lock_engines();
-
-    int upd = genhash_delete_all(bucket_engine.engines,
-                                 peh->name, peh->name_len);
-    assert(upd == 1);
-    assert(genhash_find(bucket_engine.engines,
-                        peh->name, peh->name_len) == NULL);
-    assert(peh->state == STATE_NULL);
-
-    unlock_engines();
-
-    /* to make sure release_handle unlocked peh before we free it, we
-     * briefly acquire lock again */
-    must_lock(&peh->lock);
-    must_unlock(&peh->lock);
-
-    /* and free it */
-    free_engine_handle(peh);
-
-    must_lock(&bucket_engine.destroy_count_mutex);
-    if (--bucket_engine.destroy_count == 0) {
-        pthread_cond_signal(&bucket_engine.destroy_count_zero);
-    }
-    must_unlock(&bucket_engine.destroy_count_mutex);
-
-    return NULL;
-}
-
-static void release_handle_locked(proxied_engine_handle_t *peh) {
-    assert(peh->refcount > 0);
-    if (--peh->refcount == 0) {
-        assert(peh->state == STATE_STOPPING);
-
-        // We should never free the default engine.
-        assert(peh != &bucket_engine.default_engine);
-
-        must_lock(&bucket_engine.destroy_count_mutex);
-        bucket_engine.destroy_count++;
-        must_unlock(&bucket_engine.destroy_count_mutex);
-
-        pthread_attr_t attr;
-        if (pthread_attr_init(&attr) != 0 ||
-            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0) {
-            abort();
-        }
-
-        pthread_t tid;
-        if (pthread_create(&tid, &attr, engine_destroyer, peh) != 0) {
-            abort();
-        }
-        pthread_attr_destroy(&attr);
-    }
 }
 
 static void release_handle(proxied_engine_handle_t *peh) {
@@ -497,7 +468,8 @@ static void release_handle(proxied_engine_handle_t *peh) {
     }
 
     must_lock(&peh->lock);
-    release_handle_locked(peh);
+    assert(peh->refcount > 1);
+    --peh->refcount;
     must_unlock(&peh->lock);
 }
 
@@ -561,11 +533,17 @@ static ENGINE_ERROR_CODE init_engine_handle(proxied_engine_handle_t *peh, const 
         free((void *)(peh->name));
         return ENGINE_FAILED;
     }
+    if (pthread_cond_init(&peh->stopped_state_cond, NULL) != 0) {
+        pthread_mutex_destroy(&peh->lock);
+        free((void *)(peh->name));
+        return ENGINE_FAILED;
+    }
     peh->state = STATE_RUNNING;
     return ENGINE_SUCCESS;
 }
 
 static void uninit_engine_handle(proxied_engine_handle_t *peh) {
+    pthread_cond_destroy(&peh->stopped_state_cond);
     pthread_mutex_destroy(&peh->lock);
     bucket_engine.upstream_server->stat->release_stats(peh->stats);
     free((void *)peh->name);
@@ -670,14 +648,26 @@ static proxied_engine_handle_t *get_engine_handle(ENGINE_HANDLE *h,
     }
     proxied_engine_handle_t *peh = es->peh;
 
+
     if (es->ewouldblock) {
+        bool saw_wait_ewouldblock = false;
+
         must_lock(&peh->lock);
         assert(es->ewouldblock);
 
         es->ewouldblock = false;
         peh->ewouldblock_count--;
+        if (peh->state == STATE_WAIT_EWOULDBLOCK
+            && peh->ewouldblock_count == 0) {
+            saw_wait_ewouldblock = true;
+        }
 
         must_unlock(&peh->lock);
+
+        if (saw_wait_ewouldblock) {
+            must_submit_to_all_workers(NULL, NULL,
+                                       bucket_delete_continuation, peh);
+        }
     }
 
     if (peh->state != STATE_RUNNING) {
@@ -708,25 +698,51 @@ static proxied_engine_handle_t *enlist_connection(engine_specific_t *es,
     return rv;
 }
 
-static void handle_es_disconnect(engine_specific_t *es, bool invoke_cb) {
+static void handle_es_disconnect(engine_specific_t *es, bool cookie_dies) {
     proxied_engine_handle_t *peh = es->peh;
     assert(peh);
 
-    if (invoke_cb && peh->wants_disconnects) {
-        peh->cb(es->cookie, ON_DISCONNECT, NULL, peh->cb_data);
+    must_lock(&peh->lock);
+
+    if (peh->state >= STATE_DISCONNECTING) {
+        if (es->tap) {
+            assert(cookie_dies);
+            /* we have tap disconnect while bucket is being
+             * destroyed. In this state bucket_delete_continuation
+             * will invoke underlying disconnect callback. And that
+             * callback needs to be able to get connection's engine
+             * specific. So we delay return from here until
+             * disconnection phase is done.  */
+            while (peh->state == STATE_DISCONNECTING) {
+                pthread_cond_wait(&peh->stopped_state_cond, &peh->lock);
+            }
+        }
+
+        /* if cookie is not dying we're not going to invoke callback
+         * and we cannot touch list of connections anymore. Bucket
+         * deletion thread will take care of them. */
+        must_unlock(&peh->lock);
+        bucket_engine.upstream_server->cookie->store_engine_specific(es->cookie, NULL);
+        return;
     }
 
-    bucket_engine.upstream_server->cookie->store_engine_specific(es->cookie, NULL);
-
-    must_lock(&peh->lock);
     engine_specific_t *next = es->next;
     if (next) {
         next->pprev = es->pprev;
     }
     *(es->pprev) = next;
+    /* if we're here than we haven't reached STATE_STOPPED which
+     * means that main reference is still there. */
+    assert(peh->refcount > 1);
     // Free up the engine we were using.
-    release_handle_locked(peh);
+    peh->refcount--;
     must_unlock(&peh->lock);
+
+    if (cookie_dies && peh->wants_disconnects) {
+        peh->cb(es->cookie, ON_DISCONNECT, NULL, peh->cb_data);
+    }
+
+    bucket_engine.upstream_server->cookie->store_engine_specific(es->cookie, NULL);
 
     free(es);
 }
@@ -1532,6 +1548,161 @@ static ENGINE_ERROR_CODE handle_create_bucket(ENGINE_HANDLE* handle,
     return ENGINE_SUCCESS;
 }
 
+static void bucket_delete_continuation_wait_ewouldblock(void *_peh) {
+    /*
+     * We're called as a completion callback of submit_to_all_workers,
+     * so we know that all active in-flight operations are
+     * completed. All remaining references to peh are from
+     * engine_specific structures representing live connections to
+     * this bucket. All request upcalls from memcached core will find
+     * this bucket dead and will not reach underlying engine.
+     *
+     * Few EWOULDBLOCK operation might still be in flight. We need to
+     * await their completion.
+     */
+    proxied_engine_handle_t *peh = _peh;
+    must_lock(&peh->lock);
+    peh->state = STATE_WAIT_EWOULDBLOCK;
+    int count = peh->ewouldblock_count;
+    must_unlock(&peh->lock);
+    if (count == 0) {
+        bucket_delete_continuation(peh);
+        return;
+    }
+    /* Ok, few suckers remain. Rely on last one of them to call
+     * bucket_delete_continuation */
+}
+
+static void bucket_delete_continuation_2(void *_peh);
+
+static void bucket_delete_continuation(void *_peh) {
+    proxied_engine_handle_t *peh = _peh;
+    /*
+     * We're called as a completion callback of submit_to_all_workers,
+     * so we know that all active in-flight operations are
+     * completed. All remaining references to peh are from
+     * engine_specific structures representing live connections to
+     * this bucket. All request upcalls from memcached core will find
+     * this bucket dead and will not reach underlying engine.
+     *
+     * Lets call undelying engine disconnect callbacks on all tap
+     * connections. We know that no new connection will by able to
+     * find_bucket us, so list of connections cannot grow.
+     *
+     * ON_DISCONNECT upcalls for tap connections from memcached are
+     * delayed so that we can safely call underlying engine
+     * ON_DISCONNECT callback and it can rely on get_engine_specific
+     * doing the right thing.
+     *
+     * Alse once we've reached STATE_DISCONNECTING nobody except this
+     * thread can touch list of connections.
+     */
+    must_lock(&peh->lock);
+    peh->state = STATE_DISCONNECTING;
+    must_unlock(&peh->lock);
+    /* in STATE_DISCONNECTING and greater we can rely on connection
+     * list be stable */
+    engine_specific_t *es = peh->first;
+    int count = 0;
+    while (es != NULL) {
+        if (peh->wants_disconnects && es->tap) {
+            peh->cb(es->cookie, ON_DISCONNECT, NULL, peh->cb_data);
+        }
+        /* detach cookie _after_ calling callback. So that callback
+         * can still see engine_specific of this cookie. */
+        bucket_engine.upstream_server->cookie->store_engine_specific(es->cookie, NULL);
+        /* invoke notify_io_complete to disconnect tap connections */
+        if (es->tap) {
+            bucket_engine.upstream_server->cookie->notify_io_complete(es->cookie, ENGINE_DISCONNECT);
+        }
+        es = es->next;
+        count++;
+    }
+
+    /* now allow 'hang' handle_es_disconnect to return, because we
+     * don't need cookie engine_specific anymore. */
+    must_lock(&peh->lock);
+    peh->refcount -= count;
+    /* we just killed all remaining references. Some disconnects can
+     * still be in-flight, but they've decremented refcount under lock
+     * atomically with checking for STATE_DISCONNECTING, so it was
+     * before we've set this state */
+    assert(peh->refcount == 1);
+    peh->state = STATE_STOPPED;
+    pthread_cond_broadcast(&peh->stopped_state_cond);
+    must_unlock(&peh->lock);
+
+    /* Some handle_es_disconnect can still process dequeued
+     * connections that they grabbed just before we set state to
+     * STATE_DISCONNECTING */
+
+    /* Make sure that all of workers saw STATE_STOPPED before continuing */
+    /* We cannot give up at this stage if memory is tight */
+    must_submit_to_all_workers(NULL, NULL,
+                               bucket_delete_continuation_2, peh);
+}
+
+static void *engine_terminator(void *_peh);
+
+static void bucket_delete_continuation_2(void *_peh) {
+    proxied_engine_handle_t *peh = _peh;
+    /* now we're disconnected from all memcached connections and the
+     * only reference to this peh is from engines hash table, but it
+     * cannot escape engines_mutex, because peh is not in STATE_RUNNING */
+    assert(peh->refcount == 1);
+    assert(peh->state == STATE_STOPPED);
+
+    /* we can delete it from hashtable */
+    lock_engines();
+
+    int upd = genhash_delete_all(bucket_engine.engines,
+                                 peh->name, peh->name_len);
+    assert(upd == 1);
+    assert(genhash_find(bucket_engine.engines,
+                        peh->name, peh->name_len) == NULL);
+    assert(peh->state == STATE_NULL);
+
+    unlock_engines();
+
+    /* it's safe to destroy underlying engine at last */
+    /* But we do final destruction on new thread so that potentially
+     * lengthy destroy call doesn't block memcached core */
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0 ||
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0) {
+        abort();
+    }
+
+    pthread_t tid;
+    if (pthread_create(&tid, &attr, engine_terminator, peh) != 0) {
+        abort();
+    }
+    pthread_attr_destroy(&attr);
+}
+
+static void *engine_terminator(void *_peh) {
+    proxied_engine_handle_t *peh = _peh;
+    peh->pe.v1->destroy(peh->pe.v0, peh->force_shutdown);
+
+    uninit_engine_handle(peh);
+    engine_specific_t *es = peh->first;
+    while (es != NULL) {
+        engine_specific_t *next = es->next;
+        free(es);
+        es = next;
+    }
+    free(peh);
+
+    /* send notification that bucket is destroyed  */
+    must_lock(&bucket_engine.destroy_count_mutex);
+    if (--bucket_engine.destroy_count == 0) {
+        pthread_cond_signal(&bucket_engine.destroy_count_zero);
+    }
+    must_unlock(&bucket_engine.destroy_count_mutex);
+
+    return NULL;
+}
+
 static ENGINE_ERROR_CODE handle_delete_bucket(ENGINE_HANDLE* handle,
                                               const void* cookie,
                                               protocol_binary_request_header *request,
@@ -1569,28 +1740,42 @@ static ENGINE_ERROR_CODE handle_delete_bucket(ENGINE_HANDLE* handle,
         }
     }
 
-    bool found = false;
+    protocol_binary_response_status status = PROTOCOL_BINARY_RESPONSE_KEY_ENOENT;
     proxied_engine_handle_t *peh = find_bucket(keyz);
 
     if (peh) {
         must_lock(&peh->lock);
         if (peh->state == STATE_RUNNING) {
-            found = true;
+            /* we need to set state before submitting work so that
+             * other threads really notice STATE_STOPPING before
+             * bucket_delete_continuation is called */
             peh->state = STATE_STOPPING;
-            peh->force_shutdown = force;
-            /* now drop main ref */
-            release_handle_locked(peh);
+
+            bool ok = bucket_engine.upstream_server
+                ->core->submit_to_all_workers(NULL, NULL,
+                                              bucket_delete_continuation_wait_ewouldblock, peh);
+            if (ok) {
+                status = PROTOCOL_BINARY_RESPONSE_SUCCESS;
+                peh->force_shutdown = force;
+            } else {
+                peh->state = STATE_RUNNING;
+                status = PROTOCOL_BINARY_RESPONSE_ENOMEM;
+            }
         }
         must_unlock(&peh->lock);
+
+        must_lock(&bucket_engine.destroy_count_mutex);
+        bucket_engine.destroy_count++;
+        must_unlock(&bucket_engine.destroy_count_mutex);
     }
     release_handle(peh);
 
-    if (found) {
+    if (status == PROTOCOL_BINARY_RESPONSE_SUCCESS) {
         response("", 0, "", 0, "", 0, 0, 0, 0, cookie);
     } else {
         const char *msg = "Not found.";
         response(NULL, 0, NULL, 0, msg, strlen(msg),
-                 0, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT,
+                 0, status,
                  0, cookie);
     }
 
