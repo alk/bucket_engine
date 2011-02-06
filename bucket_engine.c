@@ -53,6 +53,7 @@ typedef struct proxied_engine_handle {
                                     * (but can happen later because
                                     * some connection can hold
                                     * pointer longer) */
+    int                  ewouldblock_count;
     volatile bucket_state_t state;
 
     struct engine_specific *first;
@@ -62,6 +63,7 @@ typedef struct engine_specific {
     const void *cookie;
     proxied_engine_handle_t *peh;
     void                    *engine_specific;
+    bool                    ewouldblock;
 
     /* this pointers can be accessed under peh->lock */
     struct engine_specific *next;
@@ -667,6 +669,16 @@ static proxied_engine_handle_t *get_engine_handle(ENGINE_HANDLE *h,
     }
     proxied_engine_handle_t *peh = es->peh;
 
+    if (es->ewouldblock) {
+        must_lock(&peh->lock);
+        assert(es->ewouldblock);
+
+        es->ewouldblock = false;
+        peh->ewouldblock_count--;
+
+        must_unlock(&peh->lock);
+    }
+
     if (peh->state != STATE_RUNNING) {
         return NULL;
     }
@@ -770,6 +782,25 @@ static proxied_engine_handle_t *engine_to_engine_handle(proxied_engine_t *e) {
 
 static inline struct bucket_engine* get_handle(ENGINE_HANDLE* handle) {
     return (struct bucket_engine*)handle;
+}
+
+static ENGINE_ERROR_CODE check_ewouldblock(ENGINE_HANDLE *h, const void *cookie,
+                                           ENGINE_ERROR_CODE rv) {
+    if (rv != ENGINE_EWOULDBLOCK) {
+        return rv;
+    }
+
+    struct bucket_engine *e = (struct bucket_engine*)h;
+    engine_specific_t *es = e->upstream_server->cookie->get_engine_specific(cookie);
+    proxied_engine_handle_t *peh = es->peh;
+    must_lock(&peh->lock);
+    if (!es->ewouldblock) {
+        es->ewouldblock = true;
+        peh->ewouldblock_count++;
+    }
+    must_unlock(&peh->lock);
+
+    return rv;
 }
 
 static const engine_info* bucket_get_info(ENGINE_HANDLE* handle) {
@@ -1061,8 +1092,9 @@ static ENGINE_ERROR_CODE bucket_item_allocate(ENGINE_HANDLE* handle,
                                               const rel_time_t exptime) {
     proxied_engine_t *e = get_engine(handle, cookie);
     if (e) {
-        return e->v1->allocate(e->v0, cookie, itm, key,
-                               nkey, nbytes, flags, exptime);
+        return check_ewouldblock(handle, cookie,
+                                 e->v1->allocate(e->v0, cookie, itm, key,
+                                                 nkey, nbytes, flags, exptime));
     } else {
         return ENGINE_DISCONNECT;
     }
@@ -1076,7 +1108,9 @@ static ENGINE_ERROR_CODE bucket_item_delete(ENGINE_HANDLE* handle,
                                             uint16_t vbucket) {
     proxied_engine_t *e = get_engine(handle, cookie);
     if (e) {
-        return e->v1->remove(e->v0, cookie, key, nkey, cas, vbucket);
+        return check_ewouldblock(handle, cookie,
+                                 e->v1->remove(e->v0, cookie, key,
+                                               nkey, cas, vbucket));
     } else {
         return ENGINE_DISCONNECT;
     }
@@ -1099,7 +1133,9 @@ static ENGINE_ERROR_CODE bucket_get(ENGINE_HANDLE* handle,
                                     uint16_t vbucket) {
     proxied_engine_t *e = get_engine(handle, cookie);
     if (e) {
-        return e->v1->get(e->v0, cookie, itm, key, nkey, vbucket);
+        return check_ewouldblock(handle, cookie,
+                                 e->v1->get(e->v0, cookie, itm,
+                                            key, nkey, vbucket));
     } else {
         return ENGINE_DISCONNECT;
     }
@@ -1223,7 +1259,7 @@ static ENGINE_ERROR_CODE bucket_get_stats(ENGINE_HANDLE* handle,
                      strlen(statval), cookie);
         }
     }
-    return rc;
+    return check_ewouldblock(handle, cookie, rc);
 }
 
 static void *bucket_get_stats_struct(ENGINE_HANDLE* handle,
@@ -1244,7 +1280,9 @@ static ENGINE_ERROR_CODE bucket_store(ENGINE_HANDLE* handle,
                                       uint16_t vbucket) {
     proxied_engine_t *e = get_engine(handle, cookie);
     if (e) {
-        return e->v1->store(e->v0, cookie, itm, cas, operation, vbucket);
+        return check_ewouldblock(handle, cookie,
+                                 e->v1->store(e->v0, cookie, itm, cas,
+                                              operation, vbucket));
     } else {
         return ENGINE_DISCONNECT;
     }
@@ -1264,9 +1302,10 @@ static ENGINE_ERROR_CODE bucket_arithmetic(ENGINE_HANDLE* handle,
                                            uint16_t vbucket) {
     proxied_engine_t *e = get_engine(handle, cookie);
     if (e) {
-        return e->v1->arithmetic(e->v0, cookie, key, nkey,
-                                 increment, create, delta, initial,
-                                 exptime, cas, result, vbucket);
+        return check_ewouldblock(handle, cookie,
+                                 e->v1->arithmetic(e->v0, cookie, key, nkey,
+                                                   increment, create, delta, initial,
+                                                   exptime, cas, result, vbucket));
     } else {
         return ENGINE_DISCONNECT;
     }
@@ -1276,9 +1315,10 @@ static ENGINE_ERROR_CODE bucket_flush(ENGINE_HANDLE* handle,
                                       const void* cookie, time_t when) {
     proxied_engine_t *e = get_engine(handle, cookie);
     if (e) {
-      return e->v1->flush(e->v0, cookie, when);
+        return check_ewouldblock(handle, cookie,
+                                 e->v1->flush(e->v0, cookie, when));
     } else {
-      return ENGINE_DISCONNECT;
+        return ENGINE_DISCONNECT;
     }
 }
 
