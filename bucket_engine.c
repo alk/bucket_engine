@@ -64,6 +64,7 @@ typedef struct engine_specific {
     proxied_engine_handle_t *peh;
     void                    *engine_specific;
     bool                    ewouldblock;
+    bool                    tap;
 
     /* this pointers can be accessed under peh->lock */
     struct engine_specific *next;
@@ -803,6 +804,16 @@ static ENGINE_ERROR_CODE check_ewouldblock(ENGINE_HANDLE *h, const void *cookie,
     return rv;
 }
 
+static TAP_ITERATOR get_tap_wrapper(ENGINE_HANDLE *h, const void *cookie,
+                                    TAP_ITERATOR rv) {
+    if (rv != NULL) {
+        struct bucket_engine *e = (struct bucket_engine*)h;
+        engine_specific_t *es = e->upstream_server->cookie->get_engine_specific(cookie);
+        es->tap = true;
+    }
+    return rv;
+}
+
 static const engine_info* bucket_get_info(ENGINE_HANDLE* handle) {
     return &(get_handle(handle)->info.engine_info);
 }
@@ -1401,9 +1412,11 @@ static TAP_ITERATOR bucket_get_tap_iterator(ENGINE_HANDLE* handle, const void* c
                                             const void* userdata, size_t nuserdata) {
     proxied_engine_handle_t *e = get_engine_handle(handle, cookie);
     if (e) {
-        e->tap_iterator = e->pe.v1->get_tap_iterator(e->pe.v0, cookie,
-                                                     client, nclient,
-                                                     flags, userdata, nuserdata);
+        e->tap_iterator = get_tap_wrapper(handle, cookie,
+                                          e->pe.v1->get_tap_iterator(e->pe.v0, cookie,
+                                                                     client, nclient,
+                                                                     flags, userdata, nuserdata));
+
         return e->tap_iterator ? bucket_tap_iterator_shim : NULL;
     } else {
         return NULL;
