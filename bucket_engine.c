@@ -961,6 +961,20 @@ static void bucket_destroy(ENGINE_HANDLE* handle,
         return;
     }
 
+    {
+        struct bucket_list *list = NULL;
+        list_buckets(se, &list);
+
+        struct bucket_list *current = list;
+        while (current != NULL) {
+            proxied_engine_handle_t *peh = current->peh;
+            peh->pe.v1->destroy(peh->pe.v0, force);
+            current = current->next;
+        }
+
+        bucket_list_free(list);
+    }
+
     must_lock(&se->destroy_count_mutex);
     while (se->destroy_count != 0) {
         pthread_cond_wait(&se->destroy_count_zero,
